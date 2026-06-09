@@ -88,7 +88,7 @@ export const supportedFileTypes = {
 }
 
 export const SiteInfo = {
-  name: 'LightRAG',
+  name: 'База Знаний',
   home: '/',
-  github: 'https://github.com/HKUDS/LightRAG'
+  github: 'https://www.portalos.ru'
 }
