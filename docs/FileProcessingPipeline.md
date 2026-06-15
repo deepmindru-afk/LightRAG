@@ -118,12 +118,12 @@ The content inside the square brackets supports three forms:
 
 When parsing the hint, content without a hyphen must match an engine name exactly (`mineru` / `native` / `docling` / `legacy`); when there is content before a hyphen, the part before the hyphen is the engine and the part after is the options; when starting with a hyphen, it specifies only options. The legacy `[OPTIONS]` syntax is no longer valid; for example, `[iet]` must now be written as `[-iet]`.
 
-### 2.4 Content Extraction Engines
+### 2.4 File Parsing Engines
 
 | Engine | Description | Supported file formats (extensions) |
 | --- | --- | --- |
 | `legacy` | Legacy extraction; content is centrally extracted before joining the pipeline | `txt` `md` `mdx` `pdf` `docx` `pptx` `xlsx` `rtf` `odt` `tex` `epub` `html` `htm` `csv` `json` `xml` `yaml` `yml` `log` `conf` `ini` `properties` `sql` `bat` `sh` `c` `h` `cpp` `hpp` `py` `java` `js` `ts` `swift` `go` `rb` `php` `css` `scss` `less` |
-| `native` | Built-in intelligent structured content extractor | `docx` |
+| `native` | Built-in intelligent structured content extractor | `docx` `md` `textpack` |
 | `mineru` | External MinerU content extraction engine | `pdf` `doc` `docx` `ppt` `pptx` `xls` `xlsx` `png` `jpg` `jpeg` `jp2` `webp` `gif` `bmp` |
 | `docling` | External Docling content extraction engine | `pdf` `docx` `pptx` `xlsx` `md` `html` `xhtml` `png` `jpg` `jpeg` `tiff` `webp` `bmp` |
 
@@ -131,22 +131,102 @@ When parsing the hint, content without a hyphen must match an engine name exactl
 
 LightRAG caches the parsing results of the `mineru` and `docling` engines locally. Re-uploading the same file usually does not trigger the engine to re-parse the document. To delete the parse cache, you must click the "also delete file" option in the delete-file dialog of the document management interface. Modifying the endpoint addresses and effective extraction parameters of the `mineru` / `docling` engines will also invalidate the cache, causing the engine to re-parse the file content on the next upload of the same file.
 
-#### MinerU Configuration and Local Deployment
+#### Using the Native File Parsing Engine
+
+`native` is LightRAG's built-in structured content extractor that runs **fully locally**: it does not depend on external services such as MinerU / Docling, the extraction stage never calls a VLM, and it works out of the box with no deployment. Its runtime dependencies are only `python-docx` + `defusedxml` (required); the markdown path additionally relies on the **optional** `cairosvg` for SVG rasterization (when missing, the SVG is skipped with a warning and the rest of the content is unaffected).
+
+Supported extensions: `docx` / `md` / `textpack`. How to enable:
+
+- `docx` and `md` still default to `legacy`; select native explicitly, e.g. a default rule `LIGHTRAG_PARSER=docx:native` / `LIGHTRAG_PARSER=md:native`, or a filename hint `report.[native-iet].docx` / `notes.[native].md` (syntax in [§2.2](#22-default-rules-lightrag_parser) / [§2.3](#23-single-file-override-filename-hints)).
+- `textpack` is a native-exclusive extension and is routed to native automatically without a hint/rule.
+
+##### docx Extraction Capabilities
+
+`native` parses OOXML directly and recognizes the following structures, writing them to the corresponding sidecars (whether a sidecar is produced depends on the document's actual content; see [§4.2](#42-__parsed__-directory-structure)):
+
+| Element | Extraction behavior | Sidecar |
+| --- | --- | --- |
+| Heading levels | Heading 1–9 (inferred from `pPr/outlineLvl` or the style inheritance chain), feeding the `P` chunking strategy's heading-based splitting | `blocks.jsonl` |
+| Paragraphs | Includes hyperlink text and list auto-numbering; tracked changes keep only the final text (deletions removed) | `blocks.jsonl` |
+| Tables | 2D structure, auto-expanding merged cells (colspan/rowspan) and extracting cross-page repeated headers | `tables.json` |
+| Images / drawings | Embedded images exported to a resource directory, with placeholders left in the body | `drawings.json` + `<base>.blocks.assets/` |
+| Equations | OMML → LaTeX, distinguishing block-level vs inline | `equations.json` |
+
+Image export details:
+
+- Embedded images are exported to a `<base>.blocks.assets/` directory beside `blocks.jsonl`, supporting `png` `jpeg` `gif` `bmp` `tiff` `webp` `emf` `wmf`.
+- **SVG images**: when Word saves an SVG it stores both the vector `.svg` and a PNG raster fallback; native docx writes that **PNG fallback** (reading `<a:blip>`'s `r:embed`, which points at the PNG) and does not export the SVG vector original. For downstream VLM consumption PNG is usually sufficient, with no further rasterization needed. (Note this differs from the md path's "SVG rasterized via cairosvg" below: docx simply takes the PNG Word already generated.)
+- **VML / OLE objects** (legacy Word images, Visio diagrams, equation-editor previews, etc.): their rendered preview is exported via `v:imagedata`, commonly EMF/WMF, landing in the same assets directory; if the relationship is marked as an external link (`TargetMode="External"`), only the URL is recorded and no bytes are exported. **Note: EMF/WMF (and the previews of OLE objects such as Visio) can currently only be "extracted to disk" and cannot enter multimodal analysis** — the downstream VLM image analysis accepts only the raster formats `png` / `jpg` / `jpeg` / `gif` / `webp`, and other formats (EMF/WMF/SVG, etc.) are silently skipped (marked `skipped`; no error, and the rest of the document is unaffected). The exception is **equations**: they are stored as LaTeX text rather than images and are analyzed by the text (EXTRACT) role rather than the VLM, so they are processed normally.
+
+##### docx Paragraph Provenance (paraId) Notice
+
+native docx collects the `w14:paraId` written by Word 2013+ as a paragraph-level provenance anchor. If a document was produced by LibreOffice / WPS / older Word, or its internal docx XML was edited by hand, some paragraphs will lack paraId, and a one-time notice is logged:
+
+```text
+[parse_native] <filename>: N paragraphs lack paraId; Re-saving file in Word 2013+ to regenerate ids.
+```
+
+The affected blocks' `positions` degrade to `[{"type": "paraid", "range": null}]`. This is only a notice and **does not affect parsing success**; if you need precise paragraph provenance, follow the hint and "Save As .docx" in Word 2013+ to regenerate the ids.
+
+##### md / textpack Extraction Capabilities
+
+Beyond `docx`, the `native` engine also supports Markdown:
+
+- `md`: splits by heading (ATX `#`), recognizes native pipe tables (with header), HTML `<table>` (with `<thead>`, preserving colspan/rowspan), block-level equations (a paragraph starting with `$$` and ending with `$$`; inline `$...$` is not recognized), and embedded images (base64 data URLs). Content inside fenced code blocks (```` ``` ````) is kept verbatim and not interpreted. As with `docx`, `md` still defaults to `legacy`; select native via `LIGHTRAG_PARSER=md:native` or a filename `[native]` hint.
+- `textpack`: a TextBundle-format zip package (markdown body plus a resource directory, conventionally `assets/`; the export format of Bear / Ulysses, etc.). Only `native` supports this extension, so it is routed to native automatically without a hint/rule.
+  - **Package structure requirements** (the body is located by extension, not a fixed `text.markdown` name, so you can pack it with any zip tool):
+    - The body file may have any name, as long as its extension is `.md` or `.markdown`.
+    - If the package contains a `*.textbundle` subdirectory, **at most one is allowed** (more than one is an error), and the body is **looked up only inside that `.textbundle` subdirectory** (md files in the root are ignored).
+    - If the package contains **no** `*.textbundle` subdirectory, the body is **looked up only in the package root**.
+    - The lookup directory must contain **exactly one** `.md` / `.markdown` file: zero or more than one is an error.
+    - The directory holding the body is the "bundle root" (`bundle_root`) used for asset resolution.
+  - File-reference images embedded by relative path are resolved relative to the bundle root and **may live in any subdirectory** (not only `assets/`); directory traversal is forbidden (`..`, absolute paths, or references escaping the bundle root are skipped with a warning), and the resolved bytes must pass an image magic-byte check or they are skipped. Relative-path images in a standalone `.md` (not a textpack) are not resolved (skipped with a warning).
+- SVG images (base64 / textpack file / downloaded) are rasterized to PNG via cairosvg before being written to the sidecar; if cairosvg is unavailable or rendering fails, the image is skipped (with a warning).
+- External URL images (`![](http://...)`) are **downloaded and embedded by default** (`NATIVE_MD_IMAGE_DOWNLOAD_ENABLED` defaults to `true`); a drawing is always emitted (the fetched asset on success, or an external-link fallback on failure). Downloading allows only globally-routable public IPs (both DNS-resolved IPs and every redirect target are checked, and the socket dials the validated IP directly to defeat DNS rebinding; any ambient `HTTP(S)_PROXY` is ignored); private / loopback / link-local / reserved / CGNAT (`100.64.0.0/10`) ranges are all rejected. To allow specific internal ranges, configure a CIDR allowlist via `NATIVE_MD_IMAGE_ALLOWED_NON_PUBLIC_CIDRS`. Set the flag to `false` to instead drop external images entirely (no drawing emitted, so a document whose only images are external links produces no `drawings.json`).
+
+##### Environment Variables
+
+All of native's `NATIVE_*` environment variables and the `.native_raw/` cache directory **apply only to external-image downloading in the markdown / textpack engine**; **the docx path reads no `NATIVE_*` variable**. The two most common:
+
+- `LIGHTRAG_FORCE_REPARSE_NATIVE` (default `false`): discard the `.native_raw/` cache and re-download external images over the network.
+- `NATIVE_MD_IMAGE_DOWNLOAD_ENABLED` (default `true`): the master switch for external-image downloading; set to `false` to drop all external images.
+
+The remaining download / size / SSRF variables (`NATIVE_MD_IMAGE_DOWNLOAD_TIMEOUT` / `NATIVE_MD_IMAGE_DOWNLOAD_REQUIRED` / `NATIVE_MD_IMAGE_MAX_BYTES` / `NATIVE_MD_IMAGE_MAX_SVG_PIXELS` / `NATIVE_MD_IMAGE_ALLOWED_NON_PUBLIC_CIDRS`) — their meanings and defaults are listed in [env.example](https://github.com/HKUDS/LightRAG/blob/main/env.example) at the repository root.
+
+Downloaded external images are cached in `<file>.native_raw/` (beside `.parsed/`, analogous to `.mineru_raw`/`.docling_raw`), reused directly when re-parsing the same unchanged file instead of going back over the network; the cache is invalidated when the source content or the size / SVG-pixel / CIDR options above change. When the document is deleted (with "also delete file" checked in the delete dialog), this cache directory is removed together with `.parsed/`.
+
+#### Using the MinerU File Parsing Engine
 
 The MinerU client supports two modes; choose one:
 
-- `local`: self-hosted MinerU service (the official Docker Compose deployment is recommended); LightRAG calls the local container via HTTP.
-- `official`: directly connects to the MinerU official precise API v4; you need to apply for a token at [mineru.net](https://mineru.net).
+- `official` mode: uses MinerU's cloud API v4 service. You need to register an account at the [MinerU official website](https://mineru.net/) and create an API-KEY first. Then add the following configuration to LightRAG's `.env` file:
 
-**Local deployment with Docker Compose**
+```bash
+MINERU_API_MODE=official
+MINERU_API_TOKEN=<your_token>
+# MINERU_OFFICIAL_ENDPOINT=https://mineru.net   # Default value, usually no need to change
+```
 
-Copy `Dockerfile` and `compose.yaml` from the official GitHub repository [opendatalab/MinerU](https://github.com/opendatalab/MinerU) to your local machine. Both files can be found in the repository's `docker` directory. Then build the Docker image with the following command:
+* `local` mode: uses a locally deployed MinerU service. See the deployment instructions below. After the local MinerU service is started, add the following configuration to LightRAG's `.env` file:
+
+```bash
+MINERU_API_MODE=local
+MINERU_LOCAL_ENDPOINT=http://<your_mineru_local_server_ip>:8000
+```
+
+For the remaining detailed MinerU configuration, refer to the MinerU section of the environment variable example file [env.example](https://github.com/HKUDS/LightRAG/blob/main/env.example) at the repository root. The `official` and `local` modes each have different environment variable configurations; read the instructions in the example file carefully.
+
+#### **Local Deployment of the MinerU Service**
+
+Copy `Dockerfile` and `compose.yaml` from the official GitHub repository [opendatalab/MinerU](https://github.com/opendatalab/MinerU) to your local machine. Both files can be found in the repository's `docker` directory. For special GPUs from Chinese vendors, you need to choose the corresponding `Dockerfile`.
+
+After preparing the two files above, build the Docker image with the following command:
 
 ```bash
 docker build --tag mineru:latest .
 ```
 
-Once the image is built, start the API service with the following command (`--profile api` is required to enable the HTTP API container; the default listening port is 8000):
+Once the image is built, start the API service with the following command (the `--profile api` parameter indicates starting only MinerU's API service; the service listens on port 8000 by default):
 
 ```bash
 docker compose -f compose.yaml --profile api up -d
@@ -154,12 +234,12 @@ docker compose -f compose.yaml --profile api up -d
 
 For image build details, GPU driver setup, model weight locations, etc., refer to the official README: <https://github.com/opendatalab/MinerU>.
 
-**Advanced: enabling vLLM preload and title-level correction (optional)**
+**Advanced configuration: enabling vLLM preload and title-level correction (optional)**
 
 On top of the basic deployment, it is recommended to additionally enable two MinerU **server-side** features for your local MinerU. Both modify MinerU container-side configuration (the in-container `mineru.json` and the official `compose.yaml`), and do not involve any LightRAG env variable; title-level correction additionally requires an available LLM API.
 
 - **vLLM startup preload**: loads the VLM model into GPU memory at container startup, avoiding the model-loading latency on the first parse request.
-- **Title-level correction (`title_aided`)**: MinerU uses an external LLM to correct the title hierarchy of the parsed output, improving the quality of the structured artifacts. This is especially helpful for the [`P` (paragraph semantic) chunking strategy](#25-file-processing-options), which depends on the title structure — `P` splits by titles first, so the more accurate the title hierarchy, the better the chunking semantics.
+- **Title-level correction (`title_aided`)**: MinerU uses an external LLM to correct the title hierarchy of the parsed output, improving the quality of the structured artifacts. This is especially helpful for the [P (paragraph semantic) chunking strategy](#25-file-processing-options), which depends on the title structure; the `P` chunking strategy splits by titles first, so the more accurate the title hierarchy, the better the chunking semantics.
 
 **Step 1: Export and modify `mineru-lightrag.json`**
 
@@ -209,8 +289,8 @@ Make three changes to the `mineru-api` service: add `MINERU_TOOLS_CONFIG_JSON` t
       --host 0.0.0.0
       --port 8000
       --allow-public-http-client
-      --gpu-memory-utilization 0.45
-      --enable-vlm-preload true                              # <-- added
+      --gpu-memory-utilization 0.45         #
+      --enable-vlm-preload true             # <-- added
     ulimits:
       memlock: -1
       stack: 67108864
@@ -226,7 +306,7 @@ Make three changes to the `mineru-api` service: add `MINERU_TOOLS_CONFIG_JSON` t
               capabilities: [gpu]
 ```
 
-> In the example, `--gpu-memory-utilization`, `device_ids`, etc. are official defaults/sample values; adjust them according to your actual GPU setup. The three items `environment` / `volumes` / `command` are the additions for this change; keep everything else as in the official file.
+> In the example, adjust `gpu-memory-utilization` according to your actual GPU setup. The three items `environment` / `volumes` / `command` are the additions for this change; keep everything else as in the official file.
 
 **Step 3: Restart to take effect**
 
@@ -236,28 +316,7 @@ After making the changes, restart the API service for them to take effect:
 docker compose -f compose.yaml --profile api up -d
 ```
 
-No change is needed on the LightRAG side; just configure Local mode as described below (`MINERU_API_MODE=local` + `MINERU_LOCAL_ENDPOINT`).
-
-**LightRAG-side env configuration**
-
-Local mode (self-hosted mineru-api):
-
-```bash
-MINERU_API_MODE=local
-MINERU_LOCAL_ENDPOINT=http://localhost:8000
-```
-
-Official mode (MinerU cloud API):
-
-```bash
-MINERU_API_MODE=official
-MINERU_API_TOKEN=<your_token>
-# MINERU_OFFICIAL_ENDPOINT=https://mineru.net   # Default value, usually no need to change
-```
-
-For the remaining advanced switches (`MINERU_MODEL_VERSION`, `MINERU_LANGUAGE`, `MINERU_ENABLE_TABLE` / `MINERU_ENABLE_FORMULA`, `MINERU_PAGE_RANGES`, `MINERU_LOCAL_BACKEND` / `MINERU_LOCAL_PARSE_METHOD`, `MINERU_POLL_INTERVAL_SECONDS` / `MINERU_MAX_POLLS`, `MINERU_ENGINE_VERSION`, `LIGHTRAG_FORCE_REPARSE_MINERU`, etc.), refer to the MinerU section of the `env.example` template at the repository root. Note that `MINERU_PAGE_RANGES` has different semantics in the two modes: `official` supports a complete list (e.g., `1-3,5,7-9`), while `local` only supports a single page (`3`) or a simple range (`1-10`); it does not accept comma-separated lists.
-
-#### Docling Configuration
+#### Using the Docling File Parsing Engine
 
 The `docling` content extraction engine requires an external [docling-serve](https://github.com/DS4SD/docling-serve) service (v1 async API). Minimal configuration:
 
