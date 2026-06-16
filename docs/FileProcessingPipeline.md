@@ -42,7 +42,7 @@ MINERU_LOCAL_ENDPOINT=http://localhost:8000
 
 > `P` is LightRAG's native chunking strategy; see [Paragraph Semantic Chunking](ParagraphSemanticChunking.md) for details. For VLM configuration, see [Role-based LLM/VLM Configuration Guide](RoleSpecificLLMConfiguration.md).
 
-## 2. Content Extraction and Processing Option Configuration
+## 2. File Processing Configuration
 
 LightRAG's file processing configuration is composed of two parts: the content extraction engine determines how the original file is parsed, and the processing options determine whether multimodal analysis is performed after parsing, which chunking method to use, and whether to build a knowledge graph. Typically, the environment variable `LIGHTRAG_PARSER` is first used to set default rules by file extension, and then a `[hint]` in the filename overrides individual files. Engine and options can be written in the same configuration fragment, for example `docx:native-iet` or `report.[native-R!].docx`.
 
@@ -93,7 +93,7 @@ ext:engine-options
 ```
 
 - The left side matches the file extension, not the full filename; write `pdf:mineru`, not `*.pdf:mineru`.
-- Rules can be separated by either a comma `,` or a semicolon `;`.
+- Rules are separated by a semicolon `;` (recommended) or a comma `,`.
 - Rules are checked left to right; priority rules go in front, with the wildcard rule typically at the end.
 - The `-options` suffix after the engine serves as the default `process_options` for files matched by this rule. For example, `LIGHTRAG_PARSER=docx:native-iet` means all `.docx` files default to the `native` engine with image, table, and equation analysis enabled.
 
@@ -117,6 +117,54 @@ The content inside the square brackets supports three forms:
 ```
 
 When parsing the hint, content without a hyphen must match an engine name exactly (`mineru` / `native` / `docling` / `legacy`); when there is content before a hyphen, the part before the hyphen is the engine and the part after is the options; when starting with a hyphen, it specifies only options. The legacy `[OPTIONS]` syntax is no longer valid; for example, `[iet]` must now be written as `[-iet]`.
+
+#### Attaching chunk parameters
+
+A chunk-strategy selector (`F` / `R` / `V` / `P`) — in a `LIGHTRAG_PARSER` rule or a filename hint — may carry per-strategy chunking parameters in parentheses. Inside the parentheses a comma **only** separates parameters; rule splitting is parenthesis-aware, so this comma is never mistaken for a rule separator (both `;` and `,` remain valid rule separators, but `;` is recommended).
+
+```text
+notes.[-R(chunk_ts=800,chunk_ol=80)].md                            # filename hint
+LIGHTRAG_PARSER=pdf:legacy-R(chunk_ts=800,chunk_ol=80);*:legacy-R  # rule
+```
+
+Currently supported parameters (canonical name / short alias):
+
+| Parameter | Alias | Strategies | Type | Meaning |
+| --- | --- | --- | --- | --- |
+| `chunk_token_size` | `chunk_ts` | F / R / V / P | int (≥ 1) | Per-strategy chunk size |
+| `chunk_overlap_token_size` | `chunk_ol` | F / R / P | int (≥ 0) | Overlap between chunks (V has no overlap) |
+| `drop_references` | `drop_rf` | P | bool | Drop the trailing reference section before chunking, e.g. `paper.[-P(drop_rf=true)].pdf`. As a boolean it may be written bare: `paper.[-P(drop_rf)].pdf` means `drop_rf=true` |
+
+- `process_options` stays a pure selector string; each parameter is applied to that strategy's `chunk_options` (see §3) while the strategy's other env-derived parameters are kept. Aliases are normalized to their canonical name internally.
+- Merge priority: the selector still follows "a non-empty filename-hint options string wholesale-overrides the rule options"; parameters overlay **per strategy** — rule parameters first, then filename-hint parameters (filename wins on a shared key).
+- Validation is strict both at startup (`LIGHTRAG_PARSER`) and at upload (filename hint): an unknown parameter, a wrong type, an out-of-range value, or a parameter on a strategy that does not support it (e.g. `chunk_ol` on `V`) all raise a friendly error.
+
+> `drop_references` detection knobs `CHUNK_P_REFERENCES_TAIL_N` (default 2) / `CHUNK_P_REFERENCES_HEADINGS` (pipe-separated, default `References\|Bibliography\|参考文献`) are env-only and read live at run time. Global default can be set via env var `CHUNK_P_DROP_REFERENCES`.
+
+#### Attaching engine parameters
+
+Parameters may also be attached to the **engine token** to override an external engine's per-file behaviour. They are encoded into the persisted `parse_engine` field and feed both the engine request and its raw-bundle cache signature (so changing a parameter forces a re-parse rather than reusing a stale bundle).
+
+```text
+paper.[mineru(page_range=1-3,language=en,local_parse_method=ocr)].pdf   # filename hint
+scan.[docling(force_ocr=true)].pdf
+LIGHTRAG_PARSER=pdf:mineru(language=en);*:legacy-R                       # rule
+```
+
+Currently supported engine parameters (canonical / alias):
+
+| Engine | Parameter | Alias | Type | Notes |
+| --- | --- | --- | --- | --- |
+| `mineru` | `page_range` | `pr` | list | One or more page ranges; **see the list note below** |
+| `mineru` | `language` | — | str | OCR / model language (e.g. `en`, `ch`) |
+| `mineru` | `local_parse_method` | `local_pm` | enum | `auto` / `txt` / `ocr` (local mode) |
+| `docling` | `force_ocr` | `ocr` | bool | `true` / `false` |
+
+- **`page_range` is a list — repeat the key.** Inside `(...)` a comma only separates parameters, so a multi-segment list must repeat the key: `page_range=1-3,page_range=5,page_range=7-9` (NOT the env-var single-string form `MINERU_PAGE_RANGES="1-3,5,7-9"`). A **multi-segment** `page_range` requires `MINERU_API_MODE=official`; `local` mode accepts only a single page/range (`page_range=1-3`).
+- **`local_parse_method` is local-only.** It only affects the local MinerU request, so it is **rejected** under `MINERU_API_MODE=official` (the official API neither sends it nor folds it into the cache key — accepting it would silently do nothing).
+- Only `mineru` and `docling` accept engine parameters; attaching one to `legacy`/`native` is a friendly error. Validation runs at startup (`LIGHTRAG_PARSER`) and at upload.
+- Merge priority: engine parameters resolve for the **final engine** — a rule's engine parameters are dropped when a filename hint selects a different (usable) engine.
+- `parse_engine` is stored in hint syntax (e.g. `mineru(page_range=1-3)`) and shown in `doc_status` metadata so you can see the parse parameters a document used.
 
 ### 2.4 File Parsing Engines
 
@@ -197,7 +245,7 @@ Downloaded external images are cached in `<file>.native_raw/` (beside `.parsed/`
 
 #### Using the MinerU File Parsing Engine
 
-The MinerU client supports two modes; choose one:
+The LightRAG document processing pipeline supports MinerU as a document parser and offers two MinerU access modes:
 
 - `official` mode: uses MinerU's cloud API v4 service. You need to register an account at the [MinerU official website](https://mineru.net/) and create an API-KEY first. Then add the following configuration to LightRAG's `.env` file:
 
