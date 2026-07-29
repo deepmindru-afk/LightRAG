@@ -105,6 +105,21 @@ _ALL_STRATEGY_KEYS = {
             },
         },
         {
+            # nan bypasses ``amt <= 0`` / ``amt > 100``; reject before chunker.
+            "strategy": "semantic_vector",
+            "params": {
+                "breakpoint_threshold_type": "percentile",
+                "breakpoint_threshold_amount": float("nan"),
+            },
+        },
+        {
+            "strategy": "semantic_vector",
+            "params": {
+                "breakpoint_threshold_type": "percentile",
+                "breakpoint_threshold_amount": float("inf"),
+            },
+        },
+        {
             # malformed regex must be compiled/rejected at parse time
             "strategy": "semantic_vector",
             "params": {"sentence_split_regex": "("},
@@ -459,15 +474,22 @@ def _make_client(monkeypatch, addon_params=None):
     """
     captured: dict = {}
 
-    async def _spy(rag, texts, file_sources=None, track_id=None, chunking=None):
+    async def _spy(
+        rag,
+        texts,
+        file_sources=None,
+        track_id=None,
+        chunking=None,
+        admission_token=None,
+    ):
         captured["texts"] = texts
         captured["file_sources"] = file_sources
         captured["chunking"] = chunking
 
-    async def _noop_reserve(rag):
+    async def _noop_reserve(rag, token):
         return False
 
-    async def _noop_release(rag):
+    async def _noop_release(rag, token):
         return None
 
     monkeypatch.setattr(_dr, "pipeline_index_texts", _spy)
@@ -478,6 +500,10 @@ def _make_client(monkeypatch, addon_params=None):
     rag.addon_params = addon_params if addon_params is not None else {}
 
     app = FastAPI()
+    # The endpoints start reservation-holding work as managed asyncio tasks via
+    # request.app.state.background_tasks (normally created by the server
+    # lifespan); provide it here so the dependency resolves under TestClient.
+    app.state.background_tasks = set()
     app.include_router(
         create_document_routes(rag, SimpleNamespace(), api_key="test-key")
     )
@@ -554,6 +580,34 @@ def test_insert_text_returns_422_on_malformed_chunking_without_scheduling(monkey
     assert captured == {}
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_insert_text_returns_422_on_nonfinite_breakpoint_amount(monkeypatch, bad):
+    """Non-finite amounts must 422 on the HTTP path, not 500 via JSONResponse."""
+    import json
+
+    client, captured = _make_client(monkeypatch)
+    payload = {
+        "text": "hello",
+        "file_source": "a.md",
+        "chunking": {
+            "strategy": "semantic_vector",
+            "params": {
+                "breakpoint_threshold_type": "percentile",
+                "breakpoint_threshold_amount": bad,
+            },
+        },
+    }
+    resp = client.post(
+        "/documents/text",
+        headers={**_HEADERS, "Content-Type": "application/json"},
+        content=json.dumps(payload, allow_nan=True),
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert "detail" in body
+    assert captured == {}
+
+
 def test_insert_text_returns_422_when_size_below_inherited_overlap(monkeypatch):
     # chunk_token_size=50 in the request, overlap=100 inherited from the
     # rag's addon_params (not in the request). The model can't catch this;
@@ -577,6 +631,74 @@ def test_insert_text_returns_422_when_size_below_inherited_overlap(monkeypatch):
     )
     assert resp.status_code == 422
     assert "chunk_overlap_token_size" in resp.json()["detail"]
+    # Rejected synchronously: background indexing never scheduled.
+    assert captured == {}
+
+
+@pytest.mark.parametrize(
+    "path, body",
+    [
+        (
+            "/documents/text",
+            {
+                "text": "hello",
+                "file_source": "a.md",
+                "chunking": {
+                    "strategy": "fixed_token",
+                    "params": {"chunk_token_size": 50},
+                },
+            },
+        ),
+        (
+            "/documents/texts",
+            {
+                "texts": ["hello"],
+                "file_sources": ["a.md"],
+                "chunking": {
+                    "strategy": "fixed_token",
+                    "params": {"chunk_token_size": 50},
+                },
+            },
+        ),
+    ],
+)
+def test_insert_422_detail_is_wrapped_not_raw_exception(monkeypatch, path, body):
+    """The synchronous chunking-config 422 must not be a bare ``detail=str(exc)``
+    passthrough (GHSA-hrmj-7rvj-4hg8 / CWE-209).
+
+    The overlap-vs-size check raises the app's own controlled ``ValueError`` in
+    ``_resolve_text_chunking``; the handler wraps it as an explicit
+    ``"Invalid chunking configuration: ..."`` message. This pins, for both
+    /documents/text and /documents/texts:
+
+    - the wrapper prefix is present — the regression proof; the pre-fix code
+      returned the bare ``str(exc)`` with no prefix, so this assertion fails on
+      the old code and passes on the new;
+    - the offending config field still reaches the client (422 validation UX
+      preserved — we deliberately keep this feedback rather than genericizing);
+    - the body carries none of the raw-exception / infrastructure markers a
+      generic ``except Exception`` dump would leak (traceback text, object
+      reprs, absolute filesystem paths, errno).
+    """
+    addon = {
+        "chunker": {
+            "chunk_token_size": 1200,
+            "fixed_token": {"chunk_overlap_token_size": 100},
+        }
+    }
+    client, captured = _make_client(monkeypatch, addon_params=addon)
+    resp = client.post(path, headers=_HEADERS, json=body)
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    # Wrapper applied (fails on the pre-fix bare str(exc)).
+    assert detail.startswith("Invalid chunking configuration:")
+    # Useful validation info preserved.
+    assert "chunk_overlap_token_size" in detail
+    # No raw-exception / infrastructure text leaks into the body.
+    lowered = detail.lower()
+    for marker in ("traceback", " object at 0x", "/users/", "/app/", ".py", "errno"):
+        assert marker not in lowered, f"leaked marker {marker!r} in 422 detail"
     # Rejected synchronously: background indexing never scheduled.
     assert captured == {}
 

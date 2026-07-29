@@ -25,6 +25,28 @@ LIGHTRAG_PARSER=*:legacy-F
 - 修改 chunker 配置（`CHUNK_*`）会影响服务器重启后入队的文档。若希望旧文档的 `chunk_options` 快照也采用新配置，请重新处理这些文档。
 - 启用多模态选项（`i/t/e`）需要已有解析 sidecar，并设置 `VLM_PROCESS_ENABLE=true`。已有文档可通过重新处理在可用 sidecar 上补跑 VLM 分析；但切换解析引擎仍需要删除并重新上传。
 
+## 升级到有界管线调度
+
+引入 `PIPELINE_SCHEDULING_PAGE_SIZE`、`MAX_PENDING_DOCUMENTS` 和 `MAX_UNACKED_MANUAL_RETRIES`（见 `env.example`）的这个版本，同时改变了各 writer 通过共享状态协调时使用的**并发协议**。这是一次性的原地升级，不写任何 marker、也不写协议版本号，因此存储层无法替你识别出残留的旧 writer。所以这是一条运维要求：
+
+> **在对同一存储、同一 workspace 启动新版本之前，必须先停掉所有旧 writer。** 滚动重启时只要还留着一个旧 worker——或者一个共用同一 Redis/PostgreSQL workspace 的旧实例——就是故障场景，而不只是升级得慢一点。
+
+旧 writer 无法遵守的三件事：
+
+- **manual retry 冻结。** `/documents/reprocess_failed` 不再就地重置 `FAILED` 行。它发布一个 intent、冻结入口、等待管线转为空闲，然后在没有任何 worker 运行的前提下分页把 `FAILED`→`PENDING` 改写回去。旧 writer 不读冻结标志，于是会继续往这个被重置逻辑视为独占的窗口里入队。
+- **调度排序键。** `created_at` 现在是不可变的 `(created_at, id)` keyset 游标，以 UTC ISO-8601 时间戳写入。旧 writer 用其它格式打上的时间戳与之排序不一致，keyset 分页因此可能跳过或重复文档。
+- **派生索引。** 在 Redis 上，status 集合与 source multimap 与文档主记录在同一个事务中维护。旧 writer 只更新主记录，会把索引留成陈旧状态——此后 strict 分页与 strict 活跃计数会静默漏掉这个文档。
+
+推荐顺序：
+
+1. 停止接收新文档，等待管线跑完。在已鉴权的 `/health` 上，没有任何在途工作时 `scheduling.drain_waiting_on_workers` 为 `false`、`scheduling.drain_pending_enqueues` 为 `0`。
+2. 停掉共用该存储与 workspace 的**全部** worker 和实例。
+3. 启动新版本。
+
+不需要做数据迁移。启动后的第一轮 sweep 是一次 strict 全量 sweep，因此旧 writer 留在半途的文档——例如卡在 `PARSING`/`ANALYZING`/`PROCESSING` 但背后已没有 worker 的行——会被自动捡起并重新处理。如果确实无法排空（必须放弃一次运行），基于同样的原因，中途停止也是安全的；不安全的是事后又把旧版本启动回来。
+
+**启动后请检查日志里有没有 strict 能力告警。** 五个内置 `doc_status` 后端（JSON、Redis、PostgreSQL、MongoDB、OpenSearch）都具备全部能力。第三方后端可能不具备，而每一项缺失都是**失败关闭**而非静默降级：admission 返回 503、source-conflict 端点返回 501、scan 会一直重复检查陈旧的 `FAILED` stub。启动日志会逐项列出缺失的能力及其代价，已鉴权的 `/health` 在 `capabilities` 下报告同一份信息。设 `PIPELINE_REQUIRE_STRICT_STORAGE_READS=true` 可把这些缺口变成启动失败。有界分页没有对应旋钮：分页与 typed source 解析方法是抽象方法，缺失的后端根本无法构造。
+
 ## 入门指南
 
 ### 安装
@@ -454,6 +476,10 @@ server {
    - Nginx 首先验证 `Content-Length` 头
    - LightRAG 在上传过程中执行流式验证
    - 在两层设置适当的限制可确保更好的错误消息和安全性
+6. **服务端入库限制**（默认全部关闭，见 `env.example`）：
+   - `MAX_REQUEST_BODY_BYTES` 限制 `/documents/upload`、`/text`、`/texts` 的**原始请求体**字节数，在 ASGI 流式接收过程中累加。与 `MAX_UPLOAD_SIZE`（multipart 解析后限制单个文件）不同，它也能拦住谎报或不报 `Content-Length` 的请求体，在整个 body 读完之前就返回 **413**。
+   - `MAX_TEXTS_PER_REQUEST` 限制单个 `/documents/texts` 请求可携带的文本数量，在任何逐条存储查询之前就返回 **413**。它限制的是单个请求的扇出，因此与下面的容量上限不同，**不是**"稍后重试"类条件：超限的批次无论等多久都不会被接受，必须拆分。
+   - `MAX_PENDING_DOCUMENTS` 限制可同时处于活跃状态（`PENDING`/`PARSING`/`ANALYZING`/`PROCESSING`）或被在飞请求预留的文档数。超容量时返回 **429**,带 `Retry-After` 头,detail 里给出当前数量、本次请求数量与容量——且**在 body 传输之前**就拒绝。`/documents/scan` 与人工重试按设计突破该上限;它们产生的文档会让普通上传排队等待。
 
 ### 离线部署
 
@@ -519,7 +545,7 @@ lightrag-gunicorn --workers 2
 从示例文件 `lightrag.service.example` 创建您的服务文件 `lightrag.service`。修改服务文件中的服务启动定义：
 
 ```text
-# Set Enviroment to your Python virtual enviroment
+# Set environment to your Python virtual environment
 Environment="PATH=/home/netman/lightrag-xyj/venv/bin"
 WorkingDirectory=/home/netman/lightrag-xyj
 # ExecStart=/home/netman/lightrag-xyj/venv/bin/lightrag-server
@@ -598,7 +624,7 @@ LIGHTRAG_API_KEY=your-secure-api-key-here
 WHITELIST_PATHS=/health,/api/*
 ```
 
-> 健康检查和 Ollama 模拟端点默认不进行 API 密钥检查。为了安全原因，如果不需要提供Ollama服务，应该把`/api/*`从WHITELIST_PATHS中移除。
+> 健康检查和 Ollama 模拟端点默认不进行 API 密钥检查。为了安全原因，如果不需要提供Ollama服务，应该把`/api/*`从WHITELIST_PATHS中移除。`/health` 仍保留在白名单中用作存活探针，但其完整配置仅返回给已认证调用方——未认证请求只会得到存活信号。
 
 API Key使用的请求头是 `X-API-Key` 。以下是使用API访问LightRAG Server的一个例子：
 
@@ -632,6 +658,8 @@ lightrag-hash-password --username admin
 > 目前仅支持配置一个管理员账户和密码。尚未开发和实现完整的账户系统。
 
 如果未配置账户凭证，Web 界面将以访客身份访问系统。因此，即使仅配置了 API 密钥，所有 API 仍然可以通过访客账户访问，这仍然不安全。因此，要保护 API，需要同时配置这两种认证方法。
+
+> 尽管服务器可**同时**配置 API 密钥与账户凭证，但单个请求应**只发送** `X-API-Key` **或** `Authorization: Bearer <token>` 之一，不要同时发送。当两个请求头同时存在时，服务端会优先校验 `Authorization` token；若该 token 无效或过期，即使同时附带了有效的 `X-API-Key`，请求也会以 `401 Invalid token` 被拒绝。
 
 ## Azure OpenAI 后端配置
 
@@ -764,6 +792,16 @@ QUERY_LLM_MODEL=gpt-5
 VLM_LLM_MODEL=gpt-5-mini
 ```
 
+**按角色的模型推荐：**
+
+- **`EXTRACT`**：实体关系抽取会对每个文本块调用，选择主流的高速模型即可，并**强烈推荐使用非思考模型（关闭 reasoning/thinking 模式）**，以免抽取变慢、变贵。例如国外的 GPT-5.6-luna、Claude Haiku、Gemini-mini，国内的 DeepSeek-V4-lite、Kimi。本地部署最低可考虑 Qwen3-30B-A3B-Instruct。
+- **`QUERY`**：负责在长且嘈杂的上下文上生成最终答案，应选择比 `EXTRACT` 更好的模型，尽量提高回答质量；此处使用带思考能力的模型没有问题。
+- **`KEYWORD`**：检索前生成关键词，属于轻量、对延迟敏感的任务，**一定要选择非思考模型**以降低查询延迟，选用与 `EXTRACT` 相当的高速模型即可。
+- **`VLM`**：主流的多模态模型均可，需支持图片输入；本地部署可考虑 Qwen3.6-35B-A3B。
+- **Embedding / Reranker**：选择主流最新的模型即可。本地部署使用 `BAAI/bge-m3`（embedding）与 `BAAI/bge-reranker-v2-m3`（rerank）即可。
+
+在可接受的时间和价格范围内，优先选择评分（各类公开榜单/基准）越高的模型越好。
+
 跨 provider 规则、`QUERY_OPENAI_LLM_REASONING_EFFORT` 等 provider 专属选项、角色级 Bedrock SigV4 凭据以及队列行为，请参阅 [基于角色的 LLM/VLM 配置指南](./RoleSpecificLLMConfiguration-zh.md)。
 
 ### 多模态分析配置
@@ -879,12 +917,21 @@ RERANK_BINDING_HOST=http://localhost:8000/rerank
 RERANK_BINDING_API_KEY=your_rerank_api_key_here
 ```
 
-以下是使用阿里云提供的 Reranker 服务的示例配置：
+以下是使用阿里云提供的 Reranker 服务的示例配置（`gte-rerank-*` 和 `qwen3-vl-rerank`，它们使用嵌套的 `input`/`parameters` 报文格式）：
 
 ```
 RERANK_BINDING=aliyun
 RERANK_MODEL=gte-rerank-v2
 RERANK_BINDING_HOST=https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+RERANK_BINDING_API_KEY=your_rerank_api_key_here
+```
+
+> **阿里云 `qwen3-rerank` 系列：** 与 `gte-rerank-*`、`qwen3-vl-rerank` 不同，`qwen3-rerank` 模型使用扁平的 Cohere 风格报文（`{"model", "query", "documents", "top_n", ...}`），返回顶层的 `results`，并且使用**不同的** Cohere 兼容 endpoint —— `/compatible-api/v1/reranks`，而非上面 `gte`/`vl` 所用的 `.../text-rerank/text-rerank` 路径。由于格式与标准 Cohere 完全一致，因此使用 `RERANK_BINDING=cohere`（而非 `aliyun`）即可，无需单独的 binding。请将 `{WorkspaceId}` 与地域替换为你自己的（参见 [阿里云文本排序 API 文档](https://help.aliyun.com/zh/model-studio/text-rerank-api)）：
+
+```
+RERANK_BINDING=cohere
+RERANK_MODEL=qwen3-rerank
+RERANK_BINDING_HOST=https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-api/v1/reranks
 RERANK_BINDING_API_KEY=your_rerank_api_key_here
 ```
 
@@ -1130,7 +1177,7 @@ notes.[-R].md
 4. 使用查询端点查询系统
 5. 如果在输入目录中放入新文件，触发文档扫描
 
-`/health` 端点会返回运行状态和关键配置，包括角色 LLM 配置、LLM/embedding/rerank 队列状态、workspace/storage workspace 映射、VLM 是否启用、rerank 是否启用，以及流水线 busy/scanning/destructive 状态。
+`/health` 端点会返回运行状态和关键配置，包括角色 LLM 配置、LLM/embedding/rerank 队列状态、workspace/storage workspace 映射、VLM 是否启用、rerank 是否启用，以及流水线 busy/scanning/destructive 状态。该端点始终返回 HTTP 200 以便用作存活探针，但配置与运行诊断信息**仅返回给已认证调用方**（携带有效 JWT 或 `X-API-Key`）。未认证调用方只会收到存活信号（`status`、`auth_mode`、`core_version`、`api_version`、`pipeline_busy`/`pipeline_active`，以及 WebUI 标题/可用性等字段——这些要么同样由未认证的 `/auth-status` 端点公开，要么只是布尔值）。需携带凭证才能取得完整内容，例如 `curl -H "X-API-Key: <key>" http://localhost:9621/health`。
 
 ## 异步文档索引与进度跟踪
 

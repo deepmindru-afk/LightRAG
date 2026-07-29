@@ -113,6 +113,19 @@ data/
 └── inputs/         # Input documents
 ```
 
+### Container security (non-root)
+
+The official images run the server as a non-root user (`lightrag`, uid/gid `1000`) to satisfy CIS Docker Benchmark 4.1. The behavior is designed so existing deployments keep working on upgrade:
+
+- The container starts as root, takes ownership of the writable data directories, then drops to uid 1000 via `gosu`. This means **existing root-owned bind-mount / PVC data is adopted automatically** — no manual `chown` is needed when upgrading from an older image.
+- Ownership is fixed for `/app/data` **and** any custom locations you set via `WORKING_DIR`, `INPUT_DIR`, `PROMPT_DIR`, or `TIKTOKEN_CACHE_DIR`, so pointing data outside `/app/data` still works.
+- If you instead start the container with an explicit non-root user (Compose `user: "1000:1000"` or Kubernetes `runAsUser: 1000`), the startup `chown` is skipped — make sure the mounted directories are already owned by that uid.
+- `.env` is **not** chowned, so the host keeps ownership and you can edit it freely. It only needs to be *readable* by uid 1000, which the default `0644` permission satisfies. A `.env` mounted read-only as `0600`/`0400` owned by a different uid will fail to load (clear `PermissionError` at startup); make it readable by uid 1000, or supply configuration via environment variables instead (`env_file:` / `environment:`, or k8s `env` / `envFrom`).
+
+Passing server flags still works as before, e.g. `docker run ghcr.io/hkuds/lightrag:latest --port 9622`.
+
+> Note: the image starts as root and drops privileges at runtime (the pattern used by the official PostgreSQL/Redis images), so the *running process* is non-root while the image's configured `USER` is still root. Scanners that judge CIS 4.1 purely from the `USER` directive may still flag the image even though no server process runs as root.
+
 ### Optional: local vLLM embedding and reranker
 
 To run embedding and/or reranking locally with vLLM, run `make env-base` and answer `yes` when prompted to run the embedding model and rerank service locally via Docker.
@@ -289,6 +302,8 @@ docker compose up
 ### Offline deployment
 
 Software packages requiring `transformers`, `torch`, or `cuda` are not preinstalled in the docker images. Consequently, document extraction tools such as Docling, as well as local LLM models like Hugging Face and LMDeploy, cannot be used in an offline environment. These high-compute-resource-demanding services should not be integrated into LightRAG. Docling will be decoupled and deployed as a standalone service.
+
+The main image bundles everything the native docx parser's opt-in `smart_heading` engine parameter needs: the spaCy runtime plus the pinned `zh_core_web_sm` / `en_core_web_sm` 3.8.0 models are baked in at build time, so `smart_heading` works fully offline out of the box. The lite image ships the spaCy runtime (it comes with the `api` extra) but not the models — enabling `smart_heading` there requires installing them first (`lightrag-download-cache --spacy --spacy-install`, or see [OfflineDeployment.md](./OfflineDeployment.md) for air-gapped hosts).
 
 ## 📦 Build Docker Images
 

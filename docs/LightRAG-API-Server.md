@@ -25,6 +25,28 @@ LIGHTRAG_PARSER=*:legacy-F
 - Changing chunker settings (`CHUNK_*`) affects documents enqueued after the server restarts. Reprocess older documents if you want their stored `chunk_options` snapshot to match the new settings.
 - Enabling multimodal options (`i/t/e`) requires parsed sidecars plus `VLM_PROCESS_ENABLE=true`. Existing documents can be reprocessed to run VLM analysis on available sidecars; switching extraction engines still requires delete + re-upload.
 
+## Upgrading to bounded pipeline scheduling
+
+The release that introduces `PIPELINE_SCHEDULING_PAGE_SIZE`, `MAX_PENDING_DOCUMENTS` and `MAX_UNACKED_MANUAL_RETRIES` (see `env.example`) also changes the **concurrency protocol** writers use to coordinate through shared state. It is a one-time, in-place upgrade that writes no marker and no protocol version, so the storage cannot detect a stale writer for you. The requirement is therefore operational:
+
+> **Stop every old writer before starting a new one against the same storage and workspace.** A rolling restart that leaves one old worker — or one old instance sharing the same Redis/PostgreSQL workspace — running is the failure case, not a slower upgrade.
+
+Three things an old writer cannot honour:
+
+- **The manual retry freeze.** `/documents/reprocess_failed` no longer resets `FAILED` rows inline. It publishes an intent, freezes ingestion, waits for the pipeline to go idle, and only then rewrites `FAILED`→`PENDING` page by page with no worker running. An old writer does not read the freeze flag, so it keeps enqueueing into a window the reset assumes is exclusive.
+- **The scheduling sort key.** `created_at` is now the immutable `(created_at, id)` keyset cursor, written as a UTC ISO-8601 timestamp. Rows an old writer stamps in another format sort inconsistently against it, and a keyset page can then skip or repeat documents.
+- **Derived indexes.** On Redis the status set and the source multimap are maintained in the same transaction as the document row. An old writer updates the row only, leaving the index stale — after which strict paging and the strict active count silently omit that document.
+
+Recommended sequence:
+
+1. Stop accepting new documents and let the pipeline finish. On the authenticated `/health`, `scheduling.drain_waiting_on_workers` is `false` and `scheduling.drain_pending_enqueues` is `0` when nothing is in flight.
+2. Stop **all** workers and instances that share the storage and workspace.
+3. Start the new version.
+
+No data migration is required. The first sweep after startup is a strict full sweep, so a document an old writer left mid-flight — a row stuck in `PARSING`/`ANALYZING`/`PROCESSING` with no worker behind it — is picked up and reprocessed on its own. If a run genuinely cannot be drained, stopping mid-run is still safe for the same reason; what is not safe is starting the old version again afterwards.
+
+**After starting, check the log for a strict-capability warning.** All five built-in `doc_status` backends (JSON, Redis, PostgreSQL, MongoDB, OpenSearch) have every capability. A third-party backend may not, and each gap fails closed rather than degrading quietly: admission answers 503, the source-conflict endpoints answer 501, and a scan keeps re-examining a stale `FAILED` stub. Startup names each missing capability and what it costs, and the authenticated `/health` reports the same under `capabilities`. Set `PIPELINE_REQUIRE_STRICT_STORAGE_READS=true` to turn those gaps into a startup failure instead. There is no equivalent knob for bounded paging: the paging and typed source-resolution methods are abstract, so a backend without them cannot be constructed at all.
+
 ## Getting Started
 
 ### Installation
@@ -454,10 +476,28 @@ server {
    - Nginx validates the `Content-Length` header first
    - LightRAG performs streaming validation during upload
    - Setting appropriate limits at both layers ensures better error messages and security
+6. **Server-side ingestion limits** (all off by default, see `env.example`):
+   - `MAX_REQUEST_BODY_BYTES` bounds the raw body of `/documents/upload`, `/text`
+     and `/texts`, counted as it streams through ASGI. Unlike `MAX_UPLOAD_SIZE`
+     (which bounds one uploaded file after multipart parsing), it also stops a
+     body that understates or omits its `Content-Length`, answering **413**
+     before the whole body is read.
+   - `MAX_TEXTS_PER_REQUEST` bounds how many texts one `/documents/texts` request
+     may carry, answering **413** before any per-text storage lookup. It bounds
+     the fan-out of a single request, so — unlike the capacity limit below — it is
+     not a "retry later" condition: an oversized batch never fits and must be
+     split.
+   - `MAX_PENDING_DOCUMENTS` bounds how many documents may be active
+     (`PENDING`/`PARSING`/`ANALYZING`/`PROCESSING`) or reserved by an in-flight
+     request. Over capacity the server answers **429** with a `Retry-After`
+     header and a detail naming the current count, the requested count and the
+     capacity — refused *before* the body is transferred. `/documents/scan` and
+     manual retries exceed the cap on purpose; the documents they create make
+     ordinary uploads wait.
 
 ### Offline Deployment
 
-Official LightRAG Docker images are fully compatible with offline or air-gapped environments. If you want to build up you own  offline enviroment, please refer to [Offline Deployment Guide](./OfflineDeployment.md).
+Official LightRAG Docker images are fully compatible with offline or air-gapped environments. If you want to build up your own offline environment, please refer to [Offline Deployment Guide](./OfflineDeployment.md).
 
 ### Starting Multiple LightRAG Instances
 
@@ -519,7 +559,7 @@ lightrag-gunicorn --workers 2
 Create your service file `lightrag.service` from the sample file: `lightrag.service.example`. Modify the start options the service file:
 
 ```text
-# Set Enviroment to your Python virtual enviroment
+# Set environment to your Python virtual environment
 Environment="PATH=/home/netman/lightrag-xyj/venv/bin"
 WorkingDirectory=/home/netman/lightrag-xyj
 # ExecStart=/home/netman/lightrag-xyj/venv/bin/lightrag-server
@@ -552,7 +592,7 @@ Open WebUI uses an LLM to do the session title and session keyword generation ta
 
 ### Choose Query mode in chat
 
-The default query mode is `hybrid` if you send a message (query) from the Ollama interface of LightRAG. You can select query mode by sending a message with a query prefix.
+The default query mode is `mix` if you send a message (query) from the Ollama interface of LightRAG. You can select query mode by sending a message with a query prefix.
 
 A query prefix in the query string can determine which LightRAG query mode is used to generate the response for the query. The supported prefixes include:
 
@@ -572,7 +612,7 @@ A query prefix in the query string can determine which LightRAG query mode is us
 /mixcontext
 ```
 
-For example, the chat message `/mix What's LightRAG?` will trigger a mix mode query for LightRAG. A chat message without a query prefix will trigger a hybrid mode query by default.
+For example, the chat message `/hybrid What's LightRAG?` will trigger a hybrid mode query for LightRAG. A chat message without a query prefix will trigger a mix mode query by default.
 
 `/bypass` is not a LightRAG query mode; it will tell the API Server to pass the query directly to the underlying LLM, including the chat history. So the user can use the LLM to answer questions based on the chat history. If you are using Open WebUI as a front end, you can just switch the model to a normal LLM instead of using the `/bypass` prefix.
 
@@ -598,7 +638,7 @@ LIGHTRAG_API_KEY=your-secure-api-key-here
 WHITELIST_PATHS=/health,/api/*
 ```
 
-> Health check and Ollama emulation endpoints are excluded from API Key check by default. For security reasons, remove `/api/*` from `WHITELIST_PATHS` if the Ollama service is not required.
+> Health check and Ollama emulation endpoints are excluded from API Key check by default. For security reasons, remove `/api/*` from `WHITELIST_PATHS` if the Ollama service is not required. `/health` stays whitelisted as a liveness probe but only returns its full configuration to authenticated callers — unauthenticated requests get liveness signals only.
 
 The API key is passed using the request header `X-API-Key`. Below is an example of accessing the LightRAG Server via API:
 
@@ -632,6 +672,8 @@ The command prompts for the password and prints an `admin:{bcrypt}...` entry rea
 > Currently, only the configuration of an administrator account and password is supported. A comprehensive account system is yet to be developed and implemented.
 
 If Account credentials are not configured, the Web UI will access the system as a Guest. Therefore, even if only an API Key is configured, all APIs can still be accessed through the Guest account, which remains insecure. Hence, to safeguard the API, it is necessary to configure both authentication methods simultaneously.
+
+> Although the server can be configured with **both** an API key and account credentials, a single request should send **either** `X-API-Key` **or** `Authorization: Bearer <token>` — not both. When both headers are present, the `Authorization` token is validated first; if it is invalid or expired the request is rejected with `401 Invalid token` even when a valid `X-API-Key` is also supplied.
 
 ## For Azure OpenAI Backend
 
@@ -764,6 +806,16 @@ QUERY_LLM_MODEL=gpt-5
 VLM_LLM_MODEL=gpt-5-mini
 ```
 
+**Recommended models by role:**
+
+- **`EXTRACT`**: Entity-relation extraction runs on every chunk, so a fast, cost-effective mainstream model is enough — a **non-thinking** model (reasoning/thinking mode disabled) is strongly recommended. E.g. GPT-5.6-luna, Claude Haiku, or Gemini-mini (hosted), or DeepSeek-V4-lite / Kimi in China. For local deployment, Qwen3-30B-A3B-Instruct is a reasonable minimum.
+- **`QUERY`**: Writes the final answer from long, noisy context, so choose a *stronger* model than `EXTRACT` to maximize answer quality; a thinking-capable model is fine here.
+- **`KEYWORD`**: A lightweight, latency-sensitive step that **must** use a non-thinking model to keep query latency low; a fast model comparable to `EXTRACT` is enough.
+- **`VLM`**: Any mainstream multimodal model with image-input support works; for local deployment, consider Qwen3.6-35B-A3B.
+- **Embedding / Reranker**: Any mainstream, up-to-date model works. For local deployment, use `BAAI/bge-m3` for embeddings and `BAAI/bge-reranker-v2-m3` for reranking.
+
+Within an acceptable latency and cost budget, prefer the highest-scoring model available (per public benchmarks/leaderboards).
+
 For cross-provider rules, provider-specific options such as `QUERY_OPENAI_LLM_REASONING_EFFORT`, role-level Bedrock SigV4 credentials, and queue behavior, see [Role-Specific LLM/VLM Configuration Guide](./RoleSpecificLLMConfiguration.md).
 
 ### Multimodal Analysis Configuration
@@ -879,12 +931,21 @@ RERANK_BINDING_HOST=http://localhost:8000/rerank
 RERANK_BINDING_API_KEY=your_rerank_api_key_here
 ```
 
-Here is an example configuration for utilizing the Reranker service provided by Aliyun:
+Here is an example configuration for utilizing the Reranker service provided by Aliyun (`gte-rerank-*` and `qwen3-vl-rerank`, which use the nested `input`/`parameters` payload format):
 
 ```
 RERANK_BINDING=aliyun
 RERANK_MODEL=gte-rerank-v2
 RERANK_BINDING_HOST=https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+RERANK_BINDING_API_KEY=your_rerank_api_key_here
+```
+
+> **Aliyun `qwen3-rerank` series:** Unlike `gte-rerank-*` and `qwen3-vl-rerank`, the `qwen3-rerank` models use a flat, Cohere-style payload (`{"model", "query", "documents", "top_n", ...}`), return top-level `results`, and are served from a **different**, Cohere-compatible endpoint — `/compatible-api/v1/reranks`, not the `.../text-rerank/text-rerank` path used above. Because the format is identical to standard Cohere, configure them with `RERANK_BINDING=cohere` (not `aliyun`); no dedicated binding is needed. Replace `{WorkspaceId}` and the region with your own (see the [Aliyun Text Rerank API docs](https://help.aliyun.com/zh/model-studio/text-rerank-api)):
+
+```
+RERANK_BINDING=cohere
+RERANK_MODEL=qwen3-rerank
+RERANK_BINDING_HOST=https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-api/v1/reranks
 RERANK_BINDING_API_KEY=your_rerank_api_key_here
 ```
 
@@ -1130,7 +1191,7 @@ You can test the API endpoints using the provided curl commands or through the S
 4. Query the system using the query endpoints
 5. Trigger document scan if new files are put into the inputs directory
 
-The `/health` endpoint reports operational state and selected configuration, including role LLM configuration, LLM/embedding/rerank queue status, workspace/storage workspace mapping, VLM enablement, rerank enablement, and pipeline busy/scanning/destructive status.
+The `/health` endpoint reports operational state and selected configuration, including role LLM configuration, LLM/embedding/rerank queue status, workspace/storage workspace mapping, VLM enablement, rerank enablement, and pipeline busy/scanning/destructive status. It always returns HTTP 200 so it stays usable as a liveness probe, but the configuration and operational diagnostics are returned **only to authenticated callers** (valid JWT or `X-API-Key`). Unauthenticated callers receive only liveness signals (`status`, `auth_mode`, `core_version`, `api_version`, `pipeline_busy`/`pipeline_active`, and the WebUI title/availability fields — all of which are also exposed by the unauthenticated `/auth-status` endpoint or are plain booleans). Provide credentials to retrieve the full payload, e.g. `curl -H "X-API-Key: <key>" http://localhost:9621/health`.
 
 ## Asynchronous Document Indexing with Progress Tracking
 
