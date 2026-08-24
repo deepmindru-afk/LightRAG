@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import os
+from collections import Counter
+from typing import Any, Dict, List, Optional, Tuple
+
 import aiohttp
-from typing import Any, List, Dict, Optional, Tuple
+from dotenv import load_dotenv
 from tenacity import (
     retry,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
 )
-from .utils import logger
 
-from dotenv import load_dotenv
+from .utils import logger, normalize_rerank_result, run_in_tokenizer_executor
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -54,6 +56,13 @@ def chunk_documents_for_rerank(
     if max_tokens < 1:
         # max_tokens=0 makes the chunk window zero-width and the loop never advances
         raise ValueError(f"max_tokens must be >= 1, got {max_tokens}")
+
+    if overlap_tokens < 0:
+        # Checked up front, before the tokenizer/fallback branching below, so a
+        # negative value is always rejected -- including for a short document
+        # that never enters either windowing loop and would otherwise let the
+        # invalid value pass through unnoticed.
+        raise ValueError(f"overlap_tokens must be non-negative, got {overlap_tokens}")
 
     # Clamp overlap_tokens to ensure the loop always advances.
     # If overlap_tokens >= max_tokens the loop would never progress. Recover by
@@ -130,6 +139,29 @@ def chunk_documents_for_rerank(
     return chunked_docs, doc_indices
 
 
+async def achunk_documents_for_rerank(
+    documents: List[str],
+    max_tokens: int = 480,
+    overlap_tokens: int = 32,
+    tokenizer_model: str = "gpt-4o-mini",
+) -> Tuple[List[str], List[int]]:
+    """Async :func:`chunk_documents_for_rerank`.
+
+    Reranking runs on the query path and this function encodes and decodes once
+    per document plus once per emitted window, so on the event loop it scales the
+    stall with the number of retrieved chunks. The whole function is a single
+    submission; splitting it per document would make the executor queue grow with
+    the result set instead of with the number of in-flight requests.
+    """
+    return await run_in_tokenizer_executor(
+        chunk_documents_for_rerank,
+        documents,
+        max_tokens,
+        overlap_tokens,
+        tokenizer_model,
+    )
+
+
 def aggregate_chunk_scores(
     chunk_results: List[Dict[str, Any]],
     doc_indices: List[int],
@@ -148,17 +180,26 @@ def aggregate_chunk_scores(
     Returns:
         List of results for original documents [{"index": doc_idx, "relevance_score": score}, ...]
     """
+    if not chunk_results or not doc_indices:
+        return []
+
     # Group scores by original document index
     doc_scores: Dict[int, List[float]] = {i: [] for i in range(num_original_docs)}
 
     for result in chunk_results:
-        chunk_idx = result["index"]
-        score = result["relevance_score"]
+        normalized_result, _ = normalize_rerank_result(result, len(doc_indices))
+        if normalized_result is None:
+            continue
 
-        if 0 <= chunk_idx < len(doc_indices):
-            original_doc_idx = doc_indices[chunk_idx]
+        chunk_idx = normalized_result["index"]
+        score = normalized_result["relevance_score"]
+
+        original_doc_idx = doc_indices[chunk_idx]
+        if (
+            isinstance(original_doc_idx, int)
+            and 0 <= original_doc_idx < num_original_docs
+        ):
             doc_scores[original_doc_idx].append(score)
-
     # Aggregate scores
     aggregated_results = []
     for doc_idx, scores in doc_scores.items():
@@ -243,7 +284,7 @@ async def generic_rerank_api(
     original_top_n = top_n  # Save original top_n for post-aggregation limiting
 
     if enable_chunking:
-        documents, doc_indices = chunk_documents_for_rerank(
+        documents, doc_indices = await achunk_documents_for_rerank(
             documents, max_tokens=max_tokens_per_doc
         )
         logger.debug(
@@ -357,11 +398,33 @@ async def generic_rerank_api(
                 logger.warning("Rerank API returned empty results")
                 return []
 
-            # Standardize return format
-            standardized_results = [
-                {"index": result["index"], "relevance_score": result["relevance_score"]}
-                for result in results
-            ]
+            # Standardize valid provider results and report malformed entries as one
+            # bounded summary rather than failing the entire user query.
+            invalid_results = Counter()
+            standardized_results = []
+            for result in results:
+                normalized_result, invalid_reason = normalize_rerank_result(
+                    result, len(documents)
+                )
+                if normalized_result is None:
+                    invalid_results[invalid_reason] += 1
+                    continue
+                standardized_results.append(normalized_result)
+
+            if invalid_results:
+                invalid_summary = ", ".join(
+                    f"{reason}={count}"
+                    for reason, count in sorted(invalid_results.items())
+                )
+                logger.warning(
+                    "Discarded %s malformed rerank result(s): %s",
+                    sum(invalid_results.values()),
+                    invalid_summary,
+                )
+
+            if not standardized_results:
+                logger.warning("Rerank API returned no usable results")
+                return []
 
             # Aggregate chunk scores back to original documents if chunking was enabled
             if enable_chunking and doc_indices:

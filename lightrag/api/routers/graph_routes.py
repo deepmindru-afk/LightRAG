@@ -63,7 +63,7 @@ class EntityMergeRequest(BaseModel):
     )
     entity_to_change_into: str = Field(
         ...,
-        description="Target entity name that will receive all relationships from the source entities. This entity will be preserved.",
+        description="Target entity name that will receive all relationships from the source entities. An existing entity is preserved and merged; a missing target is created.",
         min_length=1,
         examples=["Elon Musk"],
     )
@@ -137,7 +137,12 @@ class RelationCreateRequest(BaseModel):
     )
     relation_data: Dict[str, Any] = Field(
         ...,
-        description="Dictionary containing relationship properties. Common fields include 'description', 'keywords', and 'weight'.",
+        description=(
+            "Relationship properties. Weight is the distinct-source evidence "
+            "floor plus an optional boost and cannot be below the number of "
+            "distinct real source_id values. Omit source_id for a source-less "
+            "non-negative fractional weight."
+        ),
         examples=[
             {
                 "description": "Elon Musk is the CEO of Tesla",
@@ -291,7 +296,10 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         Args:
             request (EntityUpdateRequest): Request containing:
                 - entity_name (str): Name of the entity to update
-                - updated_data (Dict[str, Any]): Dictionary of properties to update
+                - updated_data (Dict[str, Any]): Properties to update. Only
+                  entity_name (rename target), entity_type, description,
+                  source_id and file_path are accepted, each as a string; any
+                  other key or a non-string value is rejected with 400.
                 - allow_rename (bool): Whether to allow entity renaming (default: False)
                 - allow_merge (bool): Whether to merge into existing entity when renaming
                                      causes name conflict (default: False)
@@ -476,7 +484,14 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         """Update a relation's properties in the knowledge graph
 
         Args:
-            request (RelationUpdateRequest): Request containing source ID, target ID and updated data
+            request (RelationUpdateRequest): Request containing source ID,
+                target ID and updated data. Only description, keywords,
+                source_id and file_path (strings) and weight (number) are
+                accepted in updated_data; any other key or a value of the wrong
+                shape is rejected with 400. The complete updated relation must
+                keep weight at or above its distinct-source evidence count;
+                set source_id to an empty string in the same edit before
+                assigning a smaller fractional weight.
 
         Returns:
             Dict: Updated relation information
@@ -563,10 +578,11 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 entity_name=request.entity_name,
                 entity_data=request.entity_data,
             )
+            created_entity_name = result.get("entity_name", request.entity_name)
 
             return {
                 "status": "success",
-                "message": f"Entity '{request.entity_name}' created successfully",
+                "message": f"Entity '{created_entity_name}' created successfully",
                 "data": result,
             }
         except HTTPException:
@@ -602,8 +618,11 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             relation_data (dict): Relationship properties including:
                 - description (str): Textual description of the relationship
                 - keywords (str): Comma-separated keywords describing the relationship type
-                - source_id (str): Related chunk_id from which the description originates
-                - weight (float): Relationship strength/importance (default: 1.0)
+                - source_id (str): Distinct evidence chunk IDs separated by <SEP>;
+                  omit for a source-less relation
+                - weight (float): Evidence-count floor plus an optional importance
+                  boost (default: 1.0); must be non-negative and no smaller than
+                  the number of distinct real source IDs
                 - Additional custom properties as needed
 
         Response Schema:
@@ -615,8 +634,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                     "tgt_id": "Tesla",
                     "description": "Elon Musk is the CEO of Tesla",
                     "keywords": "CEO, founder",
-                    "source_id": "chunk-123<SEP>chunk-456"
-                    "weight": 1.0,
+                    "source_id": "chunk-123<SEP>chunk-456",
+                    "weight": 2.0,
                     ... (other relationship properties)
                 }
             }
@@ -634,6 +653,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 "relation_data": {
                     "description": "Elon Musk is the CEO of Tesla",
                     "keywords": "CEO, founder",
+                    "source_id": "chunk-123",
                     "weight": 1.0
                 }
             }
@@ -713,7 +733,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
 
         HTTP Status Codes:
             200: Entities merged successfully
-            400: Invalid request (e.g., empty entity list, target entity doesn't exist)
+            400: Invalid request (e.g., empty entity list, source entity doesn't exist,
+                 or a name is empty after normalization)
             500: Internal server error
 
         Example Request:
@@ -724,7 +745,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
 
         Note:
-            - The target entity (entity_to_change_into) must exist in the knowledge graph
+            - The target entity may already exist or may be a new canonical name
             - Source entities will be permanently deleted after the merge
             - This operation cannot be undone, so verify entity names before merging
         """
@@ -734,9 +755,12 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 source_entities=request.entities_to_change,
                 target_entity=request.entity_to_change_into,
             )
+            merged_entity_name = result.get(
+                "entity_name", request.entity_to_change_into
+            )
             return {
                 "status": "success",
-                "message": f"Successfully merged {len(request.entities_to_change)} entities into '{request.entity_to_change_into}'",
+                "message": f"Successfully merged {len(request.entities_to_change)} entities into '{merged_entity_name}'",
                 "data": result,
             }
         except HTTPException:

@@ -133,12 +133,6 @@ uv tool install "lightrag-hku[api]"
 # source .venv/bin/activate  # Windows: .venv\Scripts\activate
 # pip install "lightrag-hku[api]"
 
-### フロントエンド成果物のビルド
-cd lightrag_webui
-bun install --frozen-lockfile
-bun run build
-cd ..
-
 # env ファイルのセットアップ
 # env.example ファイルは GitHub リポジトリのルートからダウンロードするか、
 # ローカルのソースチェックアウトからコピーして入手してください。
@@ -226,7 +220,7 @@ make env-security-check # 任意: 現在の .env のセキュリティリスク�
 Native docx パーサーのオプトイン式エンジンパラメータ `smart_heading` は、文分割 / NER のヒューリスティック判定に spaCy を使用します。spaCy ランタイムは `api` extra に含まれています — 追加で必要なのは、バージョン固定された 2 つの言語モデル（`zh_core_web_sm` / `en_core_web_sm` 3.8.0、PyPI 未公開の GitHub release wheel）のインストールだけです：
 
 ```bash
-lightrag-download-cache --spacy --spacy-install
+lightrag-download-cache --spacy-install
 ```
 
 smart_heading はファイル / ルール単位（例：`LIGHTRAG_PARSER=docx:native(smart_heading=true)`）でも、`.env` でグローバルにも有効化できます：
@@ -238,6 +232,27 @@ DOCX_SMART_HEADING=true
 ```
 
 グローバルスイッチが有効な場合（または `LIGHTRAG_PARSER` ルールに `native(smart_heading=true)` が含まれる場合）、サーバーは起動時にモデルの存在を検証し、欠落していればインストール手順を示して即座に失敗します（fail-fast）。smart_heading を一切使わないデプロイメントにはモデルは不要です。Docker のメインイメージにはモデルが同梱されています（lite イメージには含まれません）。オフライン環境については[オフラインデプロイメントガイド](./docs/OfflineDeployment.md)を参照してください。
+
+### オプション：SVG ラスタライズ用の libcairo（native md/textpack）
+
+Native markdown/textpack パーサーは、埋め込まれた SVG 画像を `cairosvg` 経由で PNG にラスタライズします。`cairosvg` は cairo への cffi バインディングです：`pip install cairosvg`（`api` extra に含まれる）は常に成功しますが、実際にレンダリングが動作するのは、ネイティブの `libcairo` 共有ライブラリもホストに存在する場合に限られます — pip/uv はシステムライブラリをインストールできません。欠落している場合、ラスタライズは実行時に失敗し、該当の SVG はスキップされます（ドキュメントの他の部分には影響しません）。サーバーは起動時にこの機能を検証し、欠落していれば目立つ黄色の警告を表示するため、この問題がドキュメント処理時まで気づかれずに隠れてしまうことを防ぎます。
+
+各プラットフォーム向けのシステムパッケージをインストールしてください：
+
+```bash
+# Debian / Ubuntu（公式 Docker イメージには既に含まれています）
+sudo apt-get install -y libcairo2
+
+# RHEL / Fedora
+sudo dnf install -y cairo
+
+# macOS（Homebrew）
+brew install cairo
+
+# Windows：libcairo-2.dll を同梱する GTK3 ランタイムをインストールしてください
+```
+
+埋め込み SVG を含む markdown/textpack ドキュメントを処理しないデプロイメントでは、この起動時の警告は無視して構いません。
 
 ## LightRAG について
 
@@ -451,6 +466,93 @@ LightRAG は、農業、コンピュータサイエンス、法律、混合ド�
 |**Empowerment**|41.2%|**58.8%**|45.2%|**54.8%**|43.6%|**56.4%**|**50.8%**|49.2%|
 |**Overall**|45.2%|**54.8%**|48.0%|**52.0%**|47.2%|**52.8%**|**50.4%**|49.6%|
 
+
+## 📚 ドキュメントとツール一覧
+
+### リファレンスドキュメント（`docs/`）
+
+🇨🇳 が付いた項目は、同じフォルダに中国語版（`*-zh.md`）も用意されています。
+
+**デプロイとセットアップ**
+
+| ドキュメント | 内容 |
+|---|---|
+| [InteractiveSetup.md](./docs/InteractiveSetup.md) | `make env-*` セットアップウィザード：`.env` およびウィザード管理下の `docker-compose.final.yml` の生成 |
+| [DockerDeployment.md](./docs/DockerDeployment.md) | Docker / Docker Compose によるデプロイ、イメージの種類、公式 GHCR イメージの Cosign 検証 |
+| [AppleContainerSetup.md](./docs/AppleContainerSetup.md) | Apple ネイティブの `container` ランタイムで Postgres / Neo4j / Milvus のストレージスタックを動かす方法（Apple Silicon、Docker Desktop 不要） |
+| [OfflineDeployment.md](./docs/OfflineDeployment.md) | オフライン／閉域環境でのインストール：依存関係、tiktoken キャッシュ、spaCy モデルの事前導入 |
+| [MultiSiteDeployment.md](./docs/MultiSiteDeployment.md) | 1 台のリバースプロキシ配下で複数の独立インスタンスを運用し、WebUI のビルド成果物を共有する（`LIGHTRAG_API_PREFIX`） |
+| [FrontendBuildGuide.md](./docs/FrontendBuildGuide.md) | WebUI のビルドと配布の仕組み（Bun / Node）、およびビルドが必要になるインストール形態 |
+
+**サーバーと API**
+
+| ドキュメント | 内容 |
+|---|---|
+| [LightRAG-API-Server.md](./docs/LightRAG-API-Server.md) [🇨🇳](./docs/LightRAG-API-Server-zh.md) | サーバー完全ガイド：起動、設定、認証、REST エンドポイント、WebUI の使い方 |
+
+**ドキュメント処理**
+
+| ドキュメント | 内容 |
+|---|---|
+| [FileProcessingPipeline.md](./docs/FileProcessingPipeline.md) [🇨🇳](./docs/FileProcessingPipeline-zh.md) | パイプライン仕様：`LIGHTRAG_PARSER` のルーティング規則、エンジン別パラメータ、マルチモーダル解析、ドキュメント状態のライフサイクル |
+| [ParserServiceDeployment.md](./docs/ParserServiceDeployment.md) [🇨🇳](./docs/ParserServiceDeployment-zh.md) | 外部解析サービス MinerU / docling-serve の自前ホスティング（Docker、GPU、モデル重み） |
+| [ParagraphSemanticChunking.md](./docs/ParagraphSemanticChunking.md) [🇨🇳](./docs/ParagraphSemanticChunking-zh.md) | `Paragraph semantic (P)` チャンク戦略：見出し／段落／表の境界に合わせた分割、参考文献の除外 |
+| [LightRAGSidecarFormat.md](./docs/LightRAGSidecarFormat.md) [🇨🇳](./docs/LightRAGSidecarFormat-zh.md) | マルチモーダル対応パーサーエンジンが必ず出力すべき sidecar（`*.parsed/`）交換フォーマットの仕様 |
+| [ThirdPartyParser.md](./docs/ThirdPartyParser.md) [🇨🇳](./docs/ThirdPartyParser-zh.md) | 独自パーサーエンジンの開発と登録 |
+| [ParserDebugCLI.md](./docs/ParserDebugCLI.md) [🇨🇳](./docs/ParserDebugCLI-zh.md) | `python -m lightrag.parser.cli` — サーバーなしで単一ファイルをオフライン解析し、結果を確認する |
+
+**モデルとストレージ**
+
+| ドキュメント | 内容 |
+|---|---|
+| [RoleSpecificLLMConfiguration.md](./docs/RoleSpecificLLMConfiguration.md) [🇨🇳](./docs/RoleSpecificLLMConfiguration-zh.md) | ロール別（`EXTRACT` / `QUERY` / `KEYWORD` / `VLM`）の LLM・VLM 設定 |
+| [LLMProviderOptions.md](./docs/LLMProviderOptions.md) | provider 生成オプションの完全リファレンス（`OPENAI_LLM_*`、`OLLAMA_LLM_*`、`GEMINI_LLM_*`、`BEDROCK_LLM_*`、`*_EMBEDDING_*`、英語） |
+| [AsymmetricEmbedding.md](./docs/AsymmetricEmbedding.md) | クエリ／文書の非対称 embedding（`EMBEDDING_ASYMMETRIC`）とモデルごとのプレフィックス |
+| [MilvusConfigurationGuide.md](./docs/MilvusConfigurationGuide.md) | `vector_db_storage_cls_kwargs` を通じた Milvus インデックスパラメータのチューニング |
+
+**SDK と開発**
+
+| ドキュメント | 内容 |
+|---|---|
+| [ProgramingWithCore.md](./docs/ProgramingWithCore.md) | LightRAG を Python SDK として使う方法（REST では公開されていない機能を含む） |
+| [Reproduce.md](./docs/Reproduce.md) | 論文で報告した評価結果の再現手順 |
+| [UV_LOCK_GUIDE.md](./docs/UV_LOCK_GUIDE.md) | `uv.lock` を更新すべきタイミングと方法 |
+
+### 運用ツール（`lightrag/tools/`）
+
+ストレージを扱うツールはサーバーと同じように `.env` と環境変数を読み込むため、プロジェクトルートから同一の設定で実行してください。いくつかのツールはストレージをその場で書き換えます。サーバー（および他の書き込み側）を先に停止する必要があるかは各ガイドを確認してください。`rebuild_vdb` は停止が必須です。
+
+**`rebuild_vdb.py`** — `lightrag-rebuild-vdb` — [README_REBUILD_VDB.md](./lightrag/tools/README_REBUILD_VDB.md)
+
+すべてのベクトルストレージを破棄し、権威データ（グラフのノード／エッジ、`text_chunks` KV ストア）から再構築します。ベクトル書き込み失敗後の復旧、および embedding モデルや次元数を変更した後の再構築に使用します。読み取り専用の整合性チェックモードもあります。
+
+**`clean_llm_query_cache.py`** — `lightrag-clean-llmqc` — [README_CLEAN_LLM_QUERY_CACHE.md](./lightrag/tools/README_CLEAN_LLM_QUERY_CACHE.md)
+
+クエリモードの LLM キャッシュ（`mix:*`、`hybrid:*`、`local:*`、`global:*`、`naive:*`）を削除し、コストの高い抽出キャッシュは保持します。
+
+**`migrate_llm_cache.py`** — `python -m lightrag.tools.migrate_llm_cache` — [README_MIGRATE_LLM_CACHE.md](./lightrag/tools/README_MIGRATE_LLM_CACHE.md)
+
+default モードのキャッシュ（抽出・要約・マルチモーダル解析）を KV ストレージバックエンド間で移行し、workspace の分離を保ちます。
+
+**`kg_integrity_repair.py`** — `python -m lightrag.tools.kg_integrity_repair [--apply]` — [README_KG_INTEGRITY_REPAIR.md](./lightrag/tools/README_KG_INTEGRITY_REPAIR.md)
+
+グラフ全体を監査し、`full_entities` / `full_relations` の復旧アンカーから参照されていない寄与を検出、帰属不能な孤立オブジェクトを報告し、必要に応じてアンカーを補完して削除・再処理から再発見できるようにします。
+
+**`source_conflict_repair.py`** — `python -m lightrag.tools.source_conflict_repair list` / `... repair` — [README_SOURCE_CONFLICT_REPAIR.md](./lightrag/tools/README_SOURCE_CONFLICT_REPAIR.md)
+
+同一の正規 source key を主張するドキュメントを一覧表示し、運用者が選ばなかった候補を重複としてマークします。ツールが勝者を自動で決めることはなく、内容を削除することもありません。
+
+**`download_cache.py`** — `lightrag-download-cache [--spacy-install]` — [OfflineDeployment.md](./docs/OfflineDeployment.md)
+
+オフラインデプロイおよび docx の `smart_heading` エンジンパラメータに必要な tiktoken エンコーディングとバージョン固定済み spaCy モデルを事前ダウンロードします。
+
+**`hash_password.py`** — `lightrag-hash-password [--username USER]` — [LightRAG-API-Server.md](./docs/LightRAG-API-Server.md)
+
+`AUTH_ACCOUNTS` にそのまま貼り付けられる bcrypt 値を生成します。
+
+**`check_initialization.py`** — `python -m lightrag.tools.check_initialization --demo` — [ProgramingWithCore.md](./docs/ProgramingWithCore.md)
+
+SDK 用の診断ツール：`LightRAG` インスタンスが完全に初期化されているかを検証し、よくある「`await rag.initialize_storages()` の呼び忘れ」を検出します。
 
 ## 🔗 関連プロジェクト
 

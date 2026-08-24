@@ -19,6 +19,7 @@ from lightrag.constants import (
     PARSER_ENGINE_LEGACY,
     PARSER_ENGINE_NATIVE,
     PROCESS_OPTION_CHUNK_CHARS,
+    PROCESS_OPTION_CHUNK_CUSTOM,
     PROCESS_OPTION_CHUNK_FIXED,
     PROCESS_OPTION_CHUNK_VECTOR,
     PROCESS_OPTION_CHUNK_PARAGRAH,
@@ -35,6 +36,7 @@ from lightrag.parser.registry import (
     PARSER_ENGINE_REUSE,
     engine_endpoint_configured,
     engine_endpoint_requirement,
+    malformed_env_suffixes,
     supported_parser_engines,
     suffix_capabilities,
 )
@@ -49,7 +51,8 @@ from lightrag.parser.param_schema import (
 from lightrag.utils import get_env_value, logger, parse_optional_float
 
 import json
-from collections.abc import Mapping
+from functools import lru_cache
+from collections.abc import Mapping, MutableMapping
 from copy import deepcopy
 
 # Trailing parser-hint pattern: matches ``.[engine].ext`` at end of basename.
@@ -138,7 +141,7 @@ def decode_parse_engine(
 
 
 # ---------------------------------------------------------------------------
-# Per-file processing options (i/t/e/!/F/R/V/P)
+# Per-file processing options (i/t/e/!/F/R/V/P/C)
 # ---------------------------------------------------------------------------
 
 
@@ -208,7 +211,7 @@ def validate_process_options(
         errors.append(
             f"{label} specifies multiple chunking modes "
             f"({'/'.join(seen_chunkers)}); pick one of "
-            f"{PROCESS_OPTION_CHUNK_FIXED}/{PROCESS_OPTION_CHUNK_RECURSIVE}/{PROCESS_OPTION_CHUNK_VECTOR}/{PROCESS_OPTION_CHUNK_PARAGRAH}"
+            f"{PROCESS_OPTION_CHUNK_FIXED}/{PROCESS_OPTION_CHUNK_RECURSIVE}/{PROCESS_OPTION_CHUNK_VECTOR}/{PROCESS_OPTION_CHUNK_PARAGRAH}/{PROCESS_OPTION_CHUNK_CUSTOM}"
         )
     return errors
 
@@ -238,7 +241,7 @@ def parse_process_options(options: Any) -> ProcessOptions:
 
 # ---------------------------------------------------------------------------
 # Per-chunker parameter snapshot (chunk_options) — counterpart to the
-# F/R/V/P selector in ``ProcessOptions``.  ``process_options`` chooses
+# F/R/V/P/C selector in ``ProcessOptions``.  ``process_options`` chooses
 # the strategy; ``chunk_options`` carries the parameters the chosen
 # strategy reads.
 #
@@ -251,7 +254,7 @@ def parse_process_options(options: Any) -> ProcessOptions:
 # ---------------------------------------------------------------------------
 
 
-# Strategy selector (F/R/V/P) → snapshot sub-dict key.  Single source
+# Strategy selector (F/R/V/P/C) → snapshot sub-dict key.  Single source
 # of truth for the slim ``chunk_options`` shape — used by
 # :func:`resolve_chunk_options` to pick which strategy block to keep
 # and by :func:`slim_chunk_options` to project caller-supplied dicts
@@ -261,6 +264,9 @@ _CHUNK_STRATEGY_KEYS: dict[str, str] = {
     PROCESS_OPTION_CHUNK_RECURSIVE: "recursive_character",
     PROCESS_OPTION_CHUNK_VECTOR: "semantic_vector",
     PROCESS_OPTION_CHUNK_PARAGRAH: "paragraph_semantic",
+    # C deliberately reuses the fixed-token snapshot: those values map
+    # one-for-one to the six-argument legacy chunking_func contract.
+    PROCESS_OPTION_CHUNK_CUSTOM: "fixed_token",
 }
 
 
@@ -366,18 +372,137 @@ def _chunk_env_int(env_key: str, default: int | None) -> int | None:
         ) from exc
 
 
-def _env_r_separators() -> list[str]:
-    """Load CHUNK_R_SEPARATORS; empty/invalid JSON falls back to defaults."""
-    raw = os.getenv("CHUNK_R_SEPARATORS")
+@lru_cache(maxsize=32)
+def _cached_env_r_separators(raw: str | None) -> tuple[str, ...]:
+    """Parse, bound, and cache one environment separator configuration.
+
+    The cache key is the raw environment value. This keeps startup/configuration
+    diagnostics one-shot for a deployment while still reflecting a deliberate
+    runtime environment change in tests or embedded deployments.
+    """
     if not raw or not str(raw).strip():
-        return list(DEFAULT_R_SEPARATORS)
+        return DEFAULT_R_SEPARATORS
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        return list(DEFAULT_R_SEPARATORS)
-    if isinstance(parsed, list) and all(isinstance(s, str) for s in parsed):
-        return parsed
-    return list(DEFAULT_R_SEPARATORS)
+        return DEFAULT_R_SEPARATORS
+    if not isinstance(parsed, list) or not all(isinstance(s, str) for s in parsed):
+        return DEFAULT_R_SEPARATORS
+
+    from lightrag.chunker.recursive_character import (
+        inspect_r_separators,
+        log_r_separator_normalization,
+    )
+
+    normalized = inspect_r_separators(parsed)
+    if normalized.changed:
+        log_r_separator_normalization(normalized, context="CHUNK_R_SEPARATORS")
+    return tuple(normalized.separators or ())
+
+
+def env_r_separators_for(raw: str | None) -> list[str]:
+    """Return the cached, bounded cascade for an already-read raw env value.
+
+    Use this over :func:`env_r_separators` when the caller has its own cache
+    keyed on ``raw``, so key and value cannot be read from two different
+    environments.
+
+    Empty, malformed, and non-string JSON arrays retain the historic silent
+    fallback to :data:`DEFAULT_R_SEPARATORS`. A syntactically valid cascade that
+    exceeds the safety bounds is corrected and warned about once per raw value.
+    """
+    return list(_cached_env_r_separators(raw))
+
+
+def env_r_separators() -> list[str]:
+    """Return the cached, bounded ``CHUNK_R_SEPARATORS`` cascade."""
+    return env_r_separators_for(os.getenv("CHUNK_R_SEPARATORS"))
+
+
+def normalize_chunker_r_separators(
+    chunker_config: Mapping[str, Any],
+    *,
+    context: str | None = None,
+    in_place: bool = False,
+) -> tuple[Mapping[str, Any], bool]:
+    """Correct the configured R cascade and optionally report it once.
+
+    This is for long-lived chunker configuration, not document snapshots.
+    Per-document snapshots use :func:`slim_chunk_options`' silent backstop
+    instead.
+
+    Two corrections are possible, and both are reported exactly once because the
+    corrected value is what gets stored:
+
+    * a cascade breaching :data:`MAX_R_SEPARATORS` / :data:`MAX_R_SEPARATOR_CHARS`
+      is bounded;
+    * a ``separators`` value that is not a list/tuple has its key **removed**.
+      A bare ``str`` is the trap here: it satisfies ``Sequence[str]``, so bounding
+      it would iterate characters and silently turn one typo into a cascade of 64
+      single characters that looks legitimate forever after. Dropping the key
+      instead routes the chunker to its documented ``separators=None`` path.
+      ``None`` itself is a legitimate value and passes straight through.
+
+    Args:
+        chunker_config: the long-lived ``addon_params['chunker']`` mapping.
+        context: label for the one-time warning; ``None`` suppresses logging.
+        in_place: mutate ``chunker_config`` and its ``recursive_character``
+            sub-dict rather than returning corrected copies. Callers that own
+            live configuration use this so a caller-held reference to the nested
+            dict — the documented runtime-mutation idiom, see
+            :func:`lightrag.addon_params.default_addon_params` — keeps pointing
+            at the mapping that is actually read. Silently ignored when either
+            mapping is not mutable.
+
+    Returns:
+        ``(config, corrected)``. When nothing needed correcting the original
+        mapping is returned unchanged so callers can skip their cache update.
+    """
+    recursive = chunker_config.get("recursive_character")
+    if not isinstance(recursive, Mapping) or "separators" not in recursive:
+        return chunker_config, False
+
+    from lightrag.chunker.recursive_character import (
+        inspect_r_separators,
+        log_r_separator_normalization,
+    )
+
+    raw_separators = recursive["separators"]
+    drop_key = raw_separators is not None and not isinstance(
+        raw_separators, (list, tuple)
+    )
+    if drop_key:
+        normalized = None
+    else:
+        normalized = inspect_r_separators(raw_separators)
+        if not normalized.changed:
+            return chunker_config, False
+
+    if (
+        in_place
+        and isinstance(chunker_config, MutableMapping)
+        and isinstance(recursive, MutableMapping)
+    ):
+        corrected: Any = chunker_config
+        corrected_recursive: Any = recursive
+    else:
+        corrected = dict(chunker_config)
+        corrected_recursive = dict(recursive)
+        corrected["recursive_character"] = corrected_recursive
+
+    if drop_key:
+        del corrected_recursive["separators"]
+        if context is not None:
+            logger.warning(
+                f"[{context}] separators must be a list of strings, got "
+                f"{type(raw_separators).__name__}; ignoring it so the recursive "
+                f"chunker falls back to its default cascade"
+            )
+    else:
+        corrected_recursive["separators"] = normalized.separators
+        if context is not None:
+            log_r_separator_normalization(normalized, context=context)
+    return corrected, True
 
 
 def _env_bool(key: str, default: bool = False) -> bool:
@@ -431,7 +556,7 @@ def default_chunker_config() -> dict[str, Any]:
             # boundaries instead of falling through to character-level
             # splitting.  See ``constants.DEFAULT_R_SEPARATORS`` for
             # cascade order rationale.
-            "separators": _env_r_separators(),
+            "separators": env_r_separators(),
         },
         "semantic_vector": {
             "breakpoint_threshold_type": os.getenv(
@@ -533,6 +658,13 @@ def resolve_chunk_options(
 
     The returned snapshot is an independent deep copy: mutating it has
     no effect on subsequent resolutions.
+
+    This function is not purely a reader of ``addon_params``: when the live
+    ``chunker`` config carries an out-of-bounds or wrongly-typed R separator
+    cascade, it corrects that config **in place** and logs once, so the next
+    document does not repeat the warning. The correction preserves the identity
+    of the ``recursive_character`` sub-dict, keeping the documented
+    nested-mutation idiom working afterwards.
     """
     src: Mapping[str, Any] | None = None
     if isinstance(addon_params, Mapping):
@@ -541,6 +673,25 @@ def resolve_chunk_options(
             src = candidate
     if src is None:
         src = default_chunker_config()
+    else:
+        # ``ObservableAddonParams`` supports a documented nested-mutation
+        # style. Such a mutation cannot notify the top-level mapping, so the
+        # next enqueue is the first reliable chance to validate it. Correct and
+        # cache the value here; subsequent document snapshots are already
+        # bounded and therefore silent.
+        #
+        # ``in_place`` keeps the nested ``recursive_character`` dict identity:
+        # replacing it would detach a reference the caller obtained through the
+        # very idiom this branch exists to support, silently discarding every
+        # later write to it. Correcting in place also avoids re-entering
+        # ``ObservableAddonParams.__setitem__``, so a snapshot build does not
+        # invalidate the unrelated prompt-profile cache.
+        from lightrag.addon_params import ObservableAddonParams
+
+        if isinstance(addon_params, ObservableAddonParams):
+            src, _ = normalize_chunker_r_separators(
+                src, context="addon_params['chunker']", in_place=True
+            )
 
     snapshot = slim_chunk_options(src, process_options)
     if chunk_strategy_key(process_options) == "fixed_token":
@@ -570,7 +721,7 @@ def _extract_param_blocks(
     * ``engine_param_text`` is the text inside an engine-level ``(...)`` block
       (before the engine/options ``-``) when present, else ``None``.  Engine
       parameters are not accepted in Phase 1; callers reject them.
-    * ``chunk_param_texts`` maps each chunk selector char (F/R/V/P) to the raw
+    * ``chunk_param_texts`` maps each chunk selector char (F/R/V/P/C) to the raw
       text of the block that immediately follows it.
     * ``errors`` collects structural problems (unbalanced parens, a block not
       following a chunk strategy, duplicate blocks on one char).
@@ -609,7 +760,7 @@ def _extract_param_blocks(
                     engine_param = block
             else:
                 errors.append(
-                    f"parameters '({block})' must follow a chunk strategy (F/R/V/P)"
+                    f"parameters '({block})' must follow a chunk strategy (F/R/V/P/C)"
                 )
             i = nxt
             prev_meaningful = None
@@ -646,7 +797,7 @@ def _parse_chunk_param_texts(
 def split_engine_and_options(bracket_inner: str) -> tuple[str | None, str]:
     """Decompose a bracket-hint inner string into ``(engine, options)``.
 
-    Format rules (see docs/FileProcessingPipeline-zh.md):
+    Format rules (see docs/FileProcessingPipeline.md):
         - ``ENGINE-OPTIONS``: first ``-``-separated segment is the engine
           candidate; the remainder is the options string.
         - ``ENGINE``: matches a supported engine name as a whole.
@@ -910,7 +1061,7 @@ def filename_parser_directives(file_path: str | Path) -> tuple[str | None, str]:
 def filename_chunk_params(file_path: str | Path) -> dict[str, dict[str, Any]]:
     """Return the per-selector chunk parameters decoded from a filename hint.
 
-    Maps a chunk selector char (F/R/V/P) to its canonical parameter dict;
+    Maps a chunk selector char (F/R/V/P/C) to its canonical parameter dict;
     empty when the hint carries no parameters or is not a usable hint.
     """
     found = _filename_hint_match(file_path)
@@ -979,8 +1130,33 @@ def _rule_engine_and_options(engine_hint: str) -> tuple[str, str]:
     return normalize_parser_engine(head), tail.strip()
 
 
+def validate_parser_suffix_env_vars() -> None:
+    """Fail fast on malformed entries in a spec's ``extra_suffixes_env`` list.
+
+    An entry that is not a bare lowercase-alphanumeric suffix — ``*.doc`` out
+    of glob habit, or a semicolon-separated list — can never equal a real
+    ``Path.suffix``, so admitting it would do nothing while leaving the
+    operator's intent (route ``.doc`` to docling) unmet and undiagnosed. Rejecting
+    it at startup mirrors the strictness ``LIGHTRAG_PARSER`` already gets.
+    """
+    errors = [
+        f"{env_name} has malformed entries: "
+        + ", ".join(repr(token) for token in tokens)
+        + "; use bare lowercase suffixes separated by ',' (e.g. 'doc,ppt,xls')"
+        for env_name, tokens in sorted(malformed_env_suffixes().items())
+    ]
+    if errors:
+        raise ParserRoutingConfigError("; ".join(errors))
+
+
 def validate_parser_routing_config(parser_rules: str | None = None) -> None:
-    """Validate LIGHTRAG_PARSER syntax and required external parser endpoints."""
+    """Validate LIGHTRAG_PARSER syntax and required external parser endpoints.
+
+    Deployment suffix extensions are checked first: they feed engine capability
+    (``suffix_capabilities``), so a malformed list must be reported as such
+    rather than as a downstream "rule does not match any supported suffix".
+    """
+    validate_parser_suffix_env_vars()
     rules = parser_rules_from_env() if parser_rules is None else parser_rules.strip()
     if not rules:
         return
@@ -1225,7 +1401,7 @@ def _matching_rule_directives(
 class ParserDirectives:
     """Fully resolved per-file parser directives.
 
-    ``process_options`` stays a pure selector string (``i/t/e/!/F/R/V/P``);
+    ``process_options`` stays a pure selector string (``i/t/e/!/F/R/V/P/C``);
     parameters live in separate fields.  ``chunk_params`` maps a chunk
     selector char to its canonical parameter dict and feeds the existing
     ``chunk_options`` channel.  ``engine_params`` is the flat, canonical
@@ -1256,7 +1432,7 @@ def resolve_parser_directives(
            specify.
         3. Default engine ``legacy`` with empty options.
 
-    Selector (``i/t/e/!/FRVP``) keeps the legacy "filename options wholesale
+    Selector (``i/t/e/!/FRVPC``) keeps the legacy "filename options wholesale
     override rule options" behaviour.  Chunk parameters overlay per selector
     char: rule parameters first, then filename-hint parameters (filename wins
     on a shared key).

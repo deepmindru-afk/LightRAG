@@ -46,6 +46,7 @@ from lightrag.constants import (
     DEFAULT_SUMMARY_LANGUAGE,
     DEFAULT_EMBEDDING_FUNC_MAX_ASYNC,
     DEFAULT_EMBEDDING_BATCH_NUM,
+    DEFAULT_EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE,
     DEFAULT_OLLAMA_MODEL_NAME,
     DEFAULT_OLLAMA_MODEL_TAG,
     DEFAULT_RERANK_BINDING,
@@ -311,6 +312,30 @@ def normalize_binding_name(binding: str | None) -> str | None:
 def get_binding_env_value(env_key: str, default: str) -> str:
     """Read a binding env var and normalize legacy aliases."""
     return normalize_binding_name(get_env_value(env_key, default)) or default
+
+
+def normalize_api_prefix(value: str | None) -> str:
+    """Canonicalize an API prefix before handing it to FastAPI's ``root_path``.
+
+    Strips surrounding whitespace, ensures a leading slash, drops a trailing
+    slash, and treats empty/"/" as "no prefix". Raw CLI/env input like
+    ``"site01"`` or ``"/site01/"`` would otherwise feed an invalid form to
+    FastAPI and to the WebUI prefix injection.
+
+    Lives here rather than beside its consumer in ``lightrag_server`` because
+    more than one layer has to answer "is there actually a mount prefix?" --
+    ``create_app`` and the startup security banner -- and they must answer it
+    identically. Reading the raw value instead makes ``LIGHTRAG_API_PREFIX=/``
+    look like a prefixed deployment when it is not.
+    """
+    if value is None:
+        return ""
+    value = value.strip()
+    if not value or value == "/":
+        return ""
+    if not value.startswith("/"):
+        value = "/" + value
+    return value.rstrip("/")
 
 
 def parse_args() -> argparse.Namespace:
@@ -612,9 +637,20 @@ def parse_args() -> argparse.Namespace:
         "MAX_PENDING_DOCUMENTS", DEFAULT_MAX_PENDING_DOCUMENTS, int
     )
 
-    # Raw request-body ceiling for the ingestion endpoints (LR2 §9.4); 0 disables.
-    args.max_request_body_bytes = get_env_value(
-        "MAX_REQUEST_BODY_BYTES", DEFAULT_MAX_REQUEST_BODY_BYTES, int
+    # Raw request-body ceiling (LR2 §9.4); 0 disables. Whether the operator
+    # supplied a value is recorded separately and MUST NOT be inferred by
+    # comparing the value to the default: an explicit MAX_REQUEST_BODY_BYTES
+    # equal to DEFAULT_MAX_REQUEST_BODY_BYTES is indistinguishable that way, and
+    # resolve_body_limits() would then hand the text-ingestion routes the 50 MiB
+    # built-in tier instead of the ceiling the operator asked for. A None default
+    # also folds in an unparseable value: it falls back here, and falling back to
+    # the default value should mean falling back to the default tiering too.
+    _configured_body_limit = get_env_value("MAX_REQUEST_BODY_BYTES", None, int)
+    args.max_request_body_bytes_explicit = _configured_body_limit is not None
+    args.max_request_body_bytes = (
+        DEFAULT_MAX_REQUEST_BODY_BYTES
+        if _configured_body_limit is None
+        else _configured_body_limit
     )
 
     # Document fan-out ceiling for one /documents/texts request (LR2 §11); 0 disables.
@@ -654,11 +690,29 @@ def parse_args() -> argparse.Namespace:
     # EMBEDDING_DIM defaults to None - each binding will use its own default dimension
     # Value is inherited from provider defaults via wrap_embedding_func_with_attrs decorator
     args.embedding_dim = get_env_value("EMBEDDING_DIM", None, int, special_none=True)
+    # Reject non-positive dimensions here rather than downstream: the embedding
+    # factory resolves the effective dimension with a truthiness test
+    # (`args.embedding_dim if args.embedding_dim else provider_default`), so a
+    # configured 0 would silently fall back to the provider default while still
+    # satisfying the `EMBEDDING_DIM is set` startup guard, and a negative value
+    # would propagate into the vector stores unchecked.
+    if args.embedding_dim is not None and args.embedding_dim <= 0:
+        raise SystemExit(
+            f"EMBEDDING_DIM must be a positive integer (got {args.embedding_dim}). "
+            "Leave it unset to inherit the embedding binding's default dimension."
+        )
     args.embedding_send_dim = get_env_value("EMBEDDING_SEND_DIM", False, bool)
 
     # Inject chunk configuration
     args.chunk_size = get_env_value("CHUNK_SIZE", 1200, int)
     args.chunk_overlap_size = get_env_value("CHUNK_OVERLAP_SIZE", 100, int)
+    # Embedding hard-fallback overlap — independent of chunk_overlap_size above,
+    # see LightRAG.embedding_chunk_overlap_token_size.
+    args.embedding_chunk_overlap_token_size = get_env_value(
+        "EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE",
+        DEFAULT_EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE,
+        int,
+    )
 
     # Inject LLM cache configuration
     # Should not be disabled； LLM cache is required for entity/realtion rebuild after file deletion.
@@ -734,9 +788,13 @@ def parse_args() -> argparse.Namespace:
                     f"but required env vars are missing: {', '.join(missing)}"
                 )
 
-    # VLM multimodal master switch — when off, the pipeline emits a warning
-    # and skips every i/t/e item without touching the VLM. When on, the
-    # effective VLM binding must support image inputs.
+    # VLM multimodal master switch. It gates IMAGE (`i`) analysis only —
+    # table and equation items are analyzed by the EXTRACT role and ignore
+    # it. When off, a document carrying `i` does not skip its images: the
+    # first one that survives _analyze_drawing's pre-filters raises and the
+    # document lands in FAILED. When on, the effective VLM binding must
+    # accept image inputs; lollms is the only binding this server offers
+    # whose complete_if_cache rejects image_inputs outright.
     args.vlm_process_enable = get_env_value("VLM_PROCESS_ENABLE", False, bool)
     if args.vlm_process_enable:
         effective_vlm_binding = (
@@ -755,6 +813,12 @@ def parse_args() -> argparse.Namespace:
     args.cors_origins = get_env_value("CORS_ORIGINS", "*")
     args.summary_language = get_env_value("SUMMARY_LANGUAGE", DEFAULT_SUMMARY_LANGUAGE)
     args.whitelist_paths = get_env_value("WHITELIST_PATHS", "/health,/api/*")
+
+    # Single authoritative switch for the interactive API documentation
+    # surfaces (/docs, /docs/oauth2-redirect, /redoc, /openapi.json and the
+    # /static/swagger-ui mount). When False all five return 404 (issue #3666,
+    # RFC #3671). Any route audit must condition the same set on this flag.
+    args.enable_api_docs = get_env_value("ENABLE_API_DOCS", True, bool)
 
     # For JWT Auth
     args.auth_accounts = get_env_value("AUTH_ACCOUNTS", "")

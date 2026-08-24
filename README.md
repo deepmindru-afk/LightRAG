@@ -133,12 +133,6 @@ uv tool install "lightrag-hku[api]"
 # source .venv/bin/activate  # Windows: .venv\Scripts\activate
 # pip install "lightrag-hku[api]"
 
-### Build front-end artifacts
-cd lightrag_webui
-bun install --frozen-lockfile
-bun run build
-cd ..
-
 # Setup env file
 # Obtain the env.example file by downloading it from the GitHub repository root
 # or by copying it from a local source checkout.
@@ -226,7 +220,7 @@ For full description of every target see [docs/InteractiveSetup.md](./docs/Inter
 The native docx parser's opt-in `smart_heading` engine parameter uses spaCy for sentence/NER heuristics. The spaCy runtime is already included in the `api` extra — only the two pinned language models (`zh_core_web_sm` / `en_core_web_sm` 3.8.0, GitHub release wheels not published on PyPI) need one extra step:
 
 ```bash
-lightrag-download-cache --spacy --spacy-install
+lightrag-download-cache --spacy-install
 ```
 
 Enable smart_heading per file/rule (e.g. `LIGHTRAG_PARSER=docx:native(smart_heading=true)`), or globally in `.env`:
@@ -238,6 +232,27 @@ DOCX_SMART_HEADING=true
 ```
 
 When the global switch is on (or a `LIGHTRAG_PARSER` rule carries `native(smart_heading=true)`), the server verifies the models at startup and fails fast with install guidance if they are missing. Deployments that never enable smart_heading need no models. The main Docker image ships the models pre-installed (the lite image does not); for air-gapped hosts see the [Offline Deployment Guide](./docs/OfflineDeployment.md).
+
+### Optional: libcairo for SVG Rasterization (native md/textpack)
+
+The native markdown/textpack parser rasterizes embedded SVG images to PNG via `cairosvg`. `cairosvg` is a cffi binding: `pip install cairosvg` (pulled in by the `api` extra) always succeeds, but rendering only works if the native `libcairo` shared library is *also* present on the host — `pip`/`uv` cannot install system libraries. Without it, rasterization fails at runtime and the affected SVG is skipped (the rest of the document is unaffected); the server logs a warning at startup so the gap is visible before it shows up as a per-document warning later.
+
+Install the system package for your platform:
+
+```bash
+# Debian / Ubuntu (the official Docker image already includes this)
+sudo apt-get install -y libcairo2
+
+# RHEL / Fedora
+sudo dnf install -y cairo
+
+# macOS (Homebrew)
+brew install cairo
+
+# Windows: install the GTK3 runtime, which bundles libcairo-2.dll
+```
+
+Deployments that never process markdown/textpack documents with embedded SVGs can ignore the startup warning.
 
 ## About LightRAG
 
@@ -300,7 +315,7 @@ When choosing an Embedding model, pay attention to its multilingual support capa
 
 ### Enabling Reranking
 
-Enabling the Rerank option during the query phase can significantly improve query quality. However, enabling Rerank typically introduces a 1–2 second delay. To minimize latency, it is highly recommended to deploy the Rerank model locally. Any mainstream, up-to-date reranker works; for local deployment, `BAAI/bge-reranker-v2-m3` is recommended. For configuration details, please refer to the `.env.example` file. Unlike Embedding models, the Rerank model can be changed at any time during the query phase.
+Enabling the Rerank option during the query phase can significantly improve query quality. However, enabling Rerank typically introduces a 1–2 second delay. To minimize latency, it is highly recommended to deploy the Rerank model locally. Any mainstream, up-to-date reranker works; for local deployment, `BAAI/bge-reranker-v2-m3` is recommended. For configuration details, please refer to the `env.example` file. Unlike Embedding models, the Rerank model can be changed at any time during the query phase.
 
 ### Document Processing Pipeline Configuration
 
@@ -354,7 +369,7 @@ During the document insertion stage, you may also want to adjust the following e
 - **ENABLE_CONTENT_HEADINGS**: Controls whether the section heading information of a text chunk is sent to the LLM during the query stage (enabled by default, providing more context for the LLM).
 - **FORCE_LLM_SUMMARY_ON_MERGE / MAX_SOURCE_IDS_PER_RELATION**: Controls the maximum number of text chunks an `entity/relation` can be associated with.
 - **SOURCE_IDS_LIMIT_METHOD**: Controls whether to keep updating the entity/relation description once an `entity/relation` exceeds its associated text chunk limit (by default it stops updating, because at that point the entity-relation description is already rich enough and further updates add little value; skipping updates can greatly speed up knowledge base construction).
-- **DEFAULT_MAX_FILE_PATHS**: Controls the maximum number of source files an `entity/relation` can be associated with; once this limit is exceeded, new file names are no longer written to the vector storage.
+- **MAX_FILE_PATHS**: Controls the maximum number of source files an `entity/relation` can be associated with; once this limit is exceeded, new file names are no longer written to the vector storage.
 
 ### Resolving LLM Timeouts During Entity-Relation Extraction
 
@@ -451,6 +466,93 @@ LightRAG consistently outperforms NaiveRAG, RQ-RAG, HyDE, and GraphRAG across ag
 |**Empowerment**|41.2%|**58.8%**|45.2%|**54.8%**|43.6%|**56.4%**|**50.8%**|49.2%|
 |**Overall**|45.2%|**54.8%**|48.0%|**52.0%**|47.2%|**52.8%**|**50.4%**|49.6%|
 
+
+## 📚 Documentation and Tools
+
+### Reference Documentation (`docs/`)
+
+Entries marked 🇨🇳 also ship a Chinese translation as `*-zh.md` in the same folder.
+
+**Deployment and Setup**
+
+| Document | What it covers |
+|---|---|
+| [InteractiveSetup.md](./docs/InteractiveSetup.md) | The `make env-*` setup wizard: generating `.env` and the wizard-managed `docker-compose.final.yml` |
+| [DockerDeployment.md](./docs/DockerDeployment.md) | Docker / Docker Compose deployment, image variants, and Cosign verification of the official GHCR images |
+| [AppleContainerSetup.md](./docs/AppleContainerSetup.md) | Running the Postgres / Neo4j / Milvus storage stack on Apple's native `container` runtime (Apple Silicon, no Docker Desktop) |
+| [OfflineDeployment.md](./docs/OfflineDeployment.md) | Air-gapped installs: pre-installing dependencies, the tiktoken cache, and the spaCy models |
+| [MultiSiteDeployment.md](./docs/MultiSiteDeployment.md) | Several isolated instances behind one reverse proxy, sharing a single WebUI build (`LIGHTRAG_API_PREFIX`) |
+| [FrontendBuildGuide.md](./docs/FrontendBuildGuide.md) | How the WebUI is built and shipped (Bun / Node), and which install scenarios require a build |
+
+**Server and API**
+
+| Document | What it covers |
+|---|---|
+| [LightRAG-API-Server.md](./docs/LightRAG-API-Server.md) [🇨🇳](./docs/LightRAG-API-Server-zh.md) | The complete server guide: startup, configuration, authentication, REST endpoints, and WebUI usage |
+
+**Document Processing**
+
+| Document | What it covers |
+|---|---|
+| [FileProcessingPipeline.md](./docs/FileProcessingPipeline.md) [🇨🇳](./docs/FileProcessingPipeline-zh.md) | Pipeline specification: `LIGHTRAG_PARSER` routing rules, per-engine parameters, multimodal analysis, document status lifecycle |
+| [ParserServiceDeployment.md](./docs/ParserServiceDeployment.md) [🇨🇳](./docs/ParserServiceDeployment-zh.md) | Self-hosting the external MinerU and docling-serve parsing services (Docker, GPU, model weights) |
+| [ParagraphSemanticChunking.md](./docs/ParagraphSemanticChunking.md) [🇨🇳](./docs/ParagraphSemanticChunking-zh.md) | The `Paragraph semantic (P)` chunking strategy: heading/paragraph/table-aware boundaries, reference dropping |
+| [LightRAGSidecarFormat.md](./docs/LightRAGSidecarFormat.md) [🇨🇳](./docs/LightRAGSidecarFormat-zh.md) | The sidecar (`*.parsed/`) interchange format every multimodal-capable parser engine must emit |
+| [ThirdPartyParser.md](./docs/ThirdPartyParser.md) [🇨🇳](./docs/ThirdPartyParser-zh.md) | Developing and registering your own parser engine |
+| [ParserDebugCLI.md](./docs/ParserDebugCLI.md) [🇨🇳](./docs/ParserDebugCLI-zh.md) | `python -m lightrag.parser.cli` — parse a single file offline and inspect the result without a server |
+
+**Models and Storage**
+
+| Document | What it covers |
+|---|---|
+| [RoleSpecificLLMConfiguration.md](./docs/RoleSpecificLLMConfiguration.md) [🇨🇳](./docs/RoleSpecificLLMConfiguration-zh.md) | Per-role (`EXTRACT` / `QUERY` / `KEYWORD` / `VLM`) LLM and VLM configuration |
+| [LLMProviderOptions.md](./docs/LLMProviderOptions.md) | Complete reference for provider generation options (`OPENAI_LLM_*`, `OLLAMA_LLM_*`, `GEMINI_LLM_*`, `BEDROCK_LLM_*`, `*_EMBEDDING_*`) |
+| [AsymmetricEmbedding.md](./docs/AsymmetricEmbedding.md) | Query/document asymmetric embedding (`EMBEDDING_ASYMMETRIC`) and per-model prefixes |
+| [MilvusConfigurationGuide.md](./docs/MilvusConfigurationGuide.md) | Tuning Milvus index parameters through `vector_db_storage_cls_kwargs` |
+
+**SDK and Development**
+
+| Document | What it covers |
+|---|---|
+| [ProgramingWithCore.md](./docs/ProgramingWithCore.md) | Using LightRAG as a Python SDK, including features that are not exposed over REST |
+| [Reproduce.md](./docs/Reproduce.md) | Reproducing the evaluation results reported in the paper |
+| [UV_LOCK_GUIDE.md](./docs/UV_LOCK_GUIDE.md) | When and how to update `uv.lock` |
+
+### Maintenance Tools (`lightrag/tools/`)
+
+Storage-facing tools read `.env` and environment variables exactly like the server does, so run them from the project root with the same configuration. Several of them rewrite storage in place — check the linked guide for whether the server (and any other writer) has to be stopped first; `rebuild_vdb` requires it.
+
+**`rebuild_vdb.py`** — `lightrag-rebuild-vdb` — [README_REBUILD_VDB.md](./lightrag/tools/README_REBUILD_VDB.md)
+
+Drops and rebuilds every vector storage from its authoritative source (graph nodes/edges and the `text_chunks` KV store). The recovery path after a failed vector write, and after changing the embedding model or dimension. Also offers a read-only consistency check.
+
+**`clean_llm_query_cache.py`** — `lightrag-clean-llmqc` — [README_CLEAN_LLM_QUERY_CACHE.md](./lightrag/tools/README_CLEAN_LLM_QUERY_CACHE.md)
+
+Deletes query-mode LLM cache entries (`mix:*`, `hybrid:*`, `local:*`, `global:*`, `naive:*`) while preserving the expensive extraction cache.
+
+**`migrate_llm_cache.py`** — `python -m lightrag.tools.migrate_llm_cache` — [README_MIGRATE_LLM_CACHE.md](./lightrag/tools/README_MIGRATE_LLM_CACHE.md)
+
+Migrates default-mode caches (extraction, summary, multimodal analysis) between KV storage backends, preserving workspace isolation.
+
+**`kg_integrity_repair.py`** — `python -m lightrag.tools.kg_integrity_repair [--apply]` — [README_KG_INTEGRITY_REPAIR.md](./lightrag/tools/README_KG_INTEGRITY_REPAIR.md)
+
+Audits the whole graph for contributions missing from the `full_entities` / `full_relations` recovery anchors, reports irrecoverable orphans, and optionally repairs the anchors so delete/retry can discover them again.
+
+**`source_conflict_repair.py`** — `python -m lightrag.tools.source_conflict_repair list` / `... repair` — [README_SOURCE_CONFLICT_REPAIR.md](./lightrag/tools/README_SOURCE_CONFLICT_REPAIR.md)
+
+Lists documents that claim the same canonical source key, and demotes the candidates the operator did not choose to duplicates. It never picks a winner on its own and never deletes content.
+
+**`download_cache.py`** — `lightrag-download-cache [--spacy-install]` — [OfflineDeployment.md](./docs/OfflineDeployment.md)
+
+Pre-downloads the tiktoken encodings and the pinned spaCy models required for offline deployment and the docx `smart_heading` engine parameter.
+
+**`hash_password.py`** — `lightrag-hash-password [--username USER]` — [LightRAG-API-Server.md](./docs/LightRAG-API-Server.md)
+
+Generates a bcrypt value ready to paste into `AUTH_ACCOUNTS`.
+
+**`check_initialization.py`** — `python -m lightrag.tools.check_initialization --demo` — [ProgramingWithCore.md](./docs/ProgramingWithCore.md)
+
+SDK diagnostic: verifies that a `LightRAG` instance is fully initialized, catching the common "forgot `await rag.initialize_storages()`" mistake.
 
 ## 🔗 Related Projects
 

@@ -28,11 +28,13 @@ from tenacity import (
 from lightrag.utils import (
     wrap_embedding_func_with_attrs,
     safe_unicode_decode,
+    empty_length_truncated_hint,
     logger,
     TruncatedResponse,
 )
 
 from lightrag.api import __api_version__
+from lightrag.exceptions import EmptyTruncatedResponseError
 
 import numpy as np
 import base64
@@ -514,6 +516,7 @@ async def openai_complete_if_cache(
             cot_active = False
             cot_started = False
             initial_content_seen = False
+            closing_via_generator_exit = False
 
             try:
                 iteration_started = True
@@ -609,6 +612,12 @@ async def openai_complete_if_cache(
                     logger.debug(f"Streaming token usage (from API): {token_counts}")
                 elif token_tracker:
                     logger.debug("No usage information available in streaming response")
+            except GeneratorExit:
+                # Consumer disconnect mid-COT: tell the finally block below to
+                # skip its yield, which would otherwise abort cleanup with
+                # "async generator ignored GeneratorExit".
+                closing_via_generator_exit = True
+                raise
             except Exception as e:
                 # Ensure COT is properly closed before handling exception
                 if enable_cot and cot_active:
@@ -643,8 +652,9 @@ async def openai_complete_if_cache(
                     )
                 raise
             finally:
-                # Final safety check for unclosed COT tags
-                if enable_cot and cot_active:
+                # Final safety check for unclosed COT tags, skipped while
+                # closing via GeneratorExit (see the except clause above).
+                if enable_cot and cot_active and not closing_via_generator_exit:
                     try:
                         yield "</think>"
                         cot_active = False
@@ -687,6 +697,21 @@ async def openai_complete_if_cache(
 
     else:
         try:
+            # Count usage BEFORE the validation raises below: the request
+            # consumed its budget whether or not the response is usable — a
+            # reasoning model that burned the whole output budget on its
+            # trace is exactly the case that raises, and omitting it would
+            # under-report by a full-budget generation.
+            if token_tracker and hasattr(response, "usage"):
+                token_counts = {
+                    "prompt_tokens": getattr(response.usage, "prompt_tokens", 0),
+                    "completion_tokens": getattr(
+                        response.usage, "completion_tokens", 0
+                    ),
+                    "total_tokens": getattr(response.usage, "total_tokens", 0),
+                }
+                token_tracker.add_usage(token_counts)
+
             if (
                 not response
                 or not response.choices
@@ -767,16 +792,9 @@ async def openai_complete_if_cache(
                         f"reasoning_content_len={reasoning_len}"
                     )
                     if finish_reason == "length":
-                        hint = (
-                            "generation hit the token limit before emitting "
-                            "any content"
-                            + (
-                                " (budget consumed by reasoning)"
-                                if reasoning_len
-                                else ""
-                            )
-                            + "; consider raising max_tokens or disabling "
-                            "thinking mode"
+                        hint = empty_length_truncated_hint(
+                            "consider raising max_tokens or disabling thinking mode",
+                            reasoning_consumed_budget=bool(reasoning_len),
                         )
                     elif reasoning_len:
                         hint = (
@@ -786,17 +804,30 @@ async def openai_complete_if_cache(
                         )
                     else:
                         hint = "model produced no output"
-                    logger.error(
+                    error_message = (
                         f"Received empty content from OpenAI API "
                         f"({diagnostics}): {hint}"
                     )
+                    logger.error(error_message)
                     try:
                         await openai_async_client.close()
                     except Exception as close_error:
                         logger.warning(f"Failed to close OpenAI client: {close_error}")
-                    raise InvalidResponseError(
-                        f"Received empty content from OpenAI API ({diagnostics})"
-                    )
+                    # The hint rides along into the exception (and therefore
+                    # into doc_status.error_msg) rather than living only in the
+                    # server log: the operator reading the failed document is
+                    # the one who has to turn the knob.
+                    #
+                    # The TYPE selects the retry policy: token-limit exhaustion
+                    # is deterministic for a given prompt and output budget, so
+                    # it raises EmptyTruncatedResponseError — absent from the
+                    # retry predicate — and fails after one request instead of
+                    # buying two more full-budget generations plus backoff.
+                    # The other empty modes stay retryable: those are sampling
+                    # artifacts a fresh attempt can genuinely fix.
+                    if finish_reason == "length":
+                        raise EmptyTruncatedResponseError(error_message)
+                    raise InvalidResponseError(error_message)
 
             # Apply Unicode decoding to final content if needed
             if r"\u" in final_content:
@@ -812,16 +843,6 @@ async def openai_complete_if_cache(
                     f"(finish_reason=length, content_len={len(final_content)}), returning partial content"
                 )
                 final_content = TruncatedResponse(final_content)
-
-            if token_tracker and hasattr(response, "usage"):
-                token_counts = {
-                    "prompt_tokens": getattr(response.usage, "prompt_tokens", 0),
-                    "completion_tokens": getattr(
-                        response.usage, "completion_tokens", 0
-                    ),
-                    "total_tokens": getattr(response.usage, "total_tokens", 0),
-                }
-                token_tracker.add_usage(token_counts)
 
             logger.debug(f"Response content len: {len(final_content)}")
             verbose_debug(f"Response: {response}")
