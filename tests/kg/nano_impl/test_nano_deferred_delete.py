@@ -28,6 +28,21 @@ from lightrag.utils import EmbeddingFunc, compute_mdhash_id  # noqa: E402
 DIM = 8
 
 
+async def _failing_save(_on_committed) -> None:
+    """Async stand-in for ``_save_to_disk_locked`` that always fails.
+
+    ``_save_to_disk_locked`` is a coroutine function (its write runs in the
+    storage-IO pool), so a synchronous stand-in silently changes what these
+    tests prove: the caller would await ``None`` and they would pass on a
+    ``TypeError`` instead of on the ``OSError`` they are about.
+
+    It also takes the post-commit bookkeeping hook. A stand-in that fails must
+    never run it — the write did not land, so retiring the redo logs would
+    discard rows that were never persisted.
+    """
+    raise OSError("disk full")
+
+
 @pytest.fixture(autouse=True)
 def _shared_data():
     finalize_share_data()
@@ -205,7 +220,12 @@ async def test_finalize_skips_the_save_when_queued_deletes_change_nothing(tmp_pa
 
     saves: list[int] = []
     original = storage._save_to_disk_locked
-    storage._save_to_disk_locked = lambda: (saves.append(1), original())[1]
+
+    async def counting_save(on_committed):
+        saves.append(1)
+        return await original(on_committed)
+
+    storage._save_to_disk_locked = counting_save
 
     await storage.delete(["never-inserted"])
     await storage.finalize()
@@ -323,7 +343,7 @@ async def test_delete_survives_a_failed_save_then_a_concurrent_commit(tmp_path):
 
     # The flush applies the delete, then the save fails.
     original_save = writer._save_to_disk_locked
-    writer._save_to_disk_locked = lambda: (_ for _ in ()).throw(OSError("disk full"))
+    writer._save_to_disk_locked = _failing_save
     with pytest.raises(OSError):
         await writer.index_done_callback()
     assert set(writer._unsaved_deletes) == {"id1"}, "retained until the save lands"
@@ -386,7 +406,7 @@ async def test_replay_does_not_remove_a_newer_row_under_the_same_id(tmp_path):
     await _seed(writer, {"id1": "old"})
 
     original_save = writer._save_to_disk_locked
-    writer._save_to_disk_locked = lambda: (_ for _ in ()).throw(OSError("disk full"))
+    writer._save_to_disk_locked = _failing_save
     await writer.delete(["id1"])
     with pytest.raises(OSError):
         await writer.index_done_callback()
@@ -419,7 +439,7 @@ async def test_an_id_that_matched_nothing_is_never_replayed(tmp_path):
     await _seed(writer, {"seed": "s"})
 
     original_save = writer._save_to_disk_locked
-    writer._save_to_disk_locked = lambda: (_ for _ in ()).throw(OSError("disk full"))
+    writer._save_to_disk_locked = _failing_save
     await writer.upsert({"other": {"content": "o"}})
     with pytest.raises(OSError):
         await writer.index_done_callback()  # client is now dirty
@@ -452,7 +472,7 @@ async def test_repeated_failed_saves_do_not_re_delete_each_time(tmp_path):
     _spy_client_delete(storage, calls)
 
     original_save = storage._save_to_disk_locked
-    storage._save_to_disk_locked = lambda: (_ for _ in ()).throw(OSError("disk full"))
+    storage._save_to_disk_locked = _failing_save
     await storage.delete(["id1"])
     for _ in range(4):
         with pytest.raises(OSError):
@@ -468,7 +488,7 @@ def _make_save_fail(storage):
     """Make ``_save_to_disk_locked`` raise; returns a restore callable."""
     original = storage._save_to_disk_locked
 
-    def boom():
+    async def boom(_on_committed):
         raise OSError("disk full")
 
     storage._save_to_disk_locked = boom
@@ -577,15 +597,16 @@ async def test_abort_after_a_rewrite_keeps_the_redo_entry(tmp_path):
 
 @pytest.mark.offline
 @pytest.mark.asyncio
-async def test_a_rewrite_identical_to_the_removed_row_drops_the_redo_entry(
+async def test_a_rewrite_identical_in_content_survives_the_delete_replay(
     tmp_path, monkeypatch
 ):
-    """The one case the fingerprint cannot separate: a rewrite byte-identical
-    to the removed row. Materializing it must retire the entry, or the next
-    replay deletes the row we just wrote.
+    """A rewrite with the same content in the same whole second as the removed
+    row used to be indistinguishable from it, so materializing it had to retire
+    the redo entry or the next replay would delete the row just written.
+    ``__write_seq__`` separates the two versions: the entry may stay, it names
+    only the version it removed, and the rewrite survives a replay.
 
-    ``__created_at__`` is part of the record, so identity needs both the same
-    content and the same whole second — frozen here rather than raced for.
+    The clock is frozen so ``__created_at__`` cannot be what separates them.
     """
     monkeypatch.setattr(nano_impl.time, "time", lambda: 1_700_000_000.0)
 
@@ -602,16 +623,23 @@ async def test_a_rewrite_identical_to_the_removed_row_drops_the_redo_entry(
     await storage.upsert({"id1": {"content": "same"}})
     with pytest.raises(OSError):
         await storage.index_done_callback()
-    assert storage._unsaved_deletes == {}, (
-        "an identical row makes the entry moot, and keeping it would delete it"
+    assert set(storage._unsaved_deletes) == {"id1"}, (
+        "the entry names the removed version, which the rewrite is not"
+    )
+    assert (await storage.get_by_id("id1"))["content"] == "same", (
+        "the rewrite must be readable — the entry hides only the removed row"
     )
 
+    # Force the reload that resurrects the removed version before the retry:
+    # the delete replay must take it out again and keep the rewrite.
+    storage.storage_updated.value = True
     restore()
     assert await storage.index_done_callback() is True
 
     reader = _make_storage(tmp_path)
     await reader.initialize()
     assert (await reader.get_by_id("id1"))["content"] == "same"
+    assert len(reader._client) == 2, "exactly one row per id"
 
 
 @pytest.mark.offline
@@ -691,7 +719,7 @@ async def test_finalize_reloads_before_retrying_a_delete_only_save(tmp_path):
         await writer.index_done_callback()
     restore()
     assert writer._client_dirty is True
-    assert writer._unsaved_upserts is False, "the dirty state is removals only"
+    assert not writer._unsaved_upserts, "the dirty state is removals only"
 
     # Another writer commits after our failed save.
     await other.upsert({"id3": {"content": "gamma"}})
@@ -710,9 +738,15 @@ async def test_finalize_reloads_before_retrying_a_delete_only_save(tmp_path):
 
 @pytest.mark.offline
 @pytest.mark.asyncio
-async def test_finalize_still_protects_unsaved_upserts_from_the_reload(tmp_path):
-    """The other half of the same guard: materialized-but-unsaved *rows* exist
-    nowhere else, so finalize must keep skipping the reload for them."""
+async def test_finalize_replays_unsaved_upserts_after_a_foreign_commit(tmp_path):
+    """The upsert half of the same trade-off, closed by the redo log (#3688).
+
+    Before the log, finalize skipped the reload while ``_unsaved_upserts``
+    was set (the materialized rows existed nowhere else), and its save wrote
+    our pre-commit snapshot over the other writer's durable rows — id3
+    disappeared. Now the log replays our rows after the reload, so both
+    sides survive.
+    """
     writer = _make_storage(tmp_path)
     other = _make_storage(tmp_path)
     await writer.initialize()
@@ -724,7 +758,7 @@ async def test_finalize_still_protects_unsaved_upserts_from_the_reload(tmp_path)
     with pytest.raises(OSError):
         await writer.index_done_callback()
     restore()
-    assert writer._unsaved_upserts is True
+    assert writer._unsaved_upserts, "the flushed doc moved into the redo log"
 
     await other.upsert({"id3": {"content": "gamma"}})
     assert await other.index_done_callback() is True
@@ -734,7 +768,10 @@ async def test_finalize_still_protects_unsaved_upserts_from_the_reload(tmp_path)
     reader = _make_storage(tmp_path)
     await reader.initialize()
     assert (await reader.get_by_id("id2"))["content"] == "beta", (
-        "a reload would have dropped the only copy of this row"
+        "the redo log must replay our row on top of the reloaded snapshot"
+    )
+    assert (await reader.get_by_id("id3"))["content"] == "gamma", (
+        "the other writer's commit must survive finalize"
     )
 
 
